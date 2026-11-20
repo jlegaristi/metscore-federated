@@ -1,10 +1,4 @@
-"""
-Data loading and fold generation.
-
-Folds are cut once, stratified within cohort, and consumed identically by every
-arm, so the unified arm's fold *k* is exactly the union of each client's fold
-*k*.
-"""
+"""Data loading and fold assignment, shared by every arm."""
 
 from __future__ import annotations
 
@@ -13,8 +7,9 @@ from sklearn.model_selection import StratifiedKFold
 
 from .config import BIOMARKERS, DATA_DIR, METADATA, TARGET
 
+
 def load_discovery() -> pd.DataFrame:
-    """The 20,662 DISCOVERY subjects with biomarkers, label and demographics."""
+    """The DISCOVERY cohort: biomarkers, label, cohort and demographics."""
     path = DATA_DIR / "discovery.csv"
     if not path.exists():
         raise FileNotFoundError(
@@ -22,8 +17,9 @@ def load_discovery() -> pd.DataFrame:
         )
     return pd.read_csv(path)
 
+
 def load_external() -> pd.DataFrame:
-    """The 661-subject external validation cohort."""
+    """The external VALIDATION cohort."""
     path = DATA_DIR / "external.csv"
     if not path.exists():
         raise FileNotFoundError(
@@ -31,13 +27,12 @@ def load_external() -> pd.DataFrame:
         )
     return pd.read_csv(path)
 
-def assign_folds(df: pd.DataFrame, n_folds: int, seed: int) -> pd.Series:
-    """Stratified fold labels, computed within each cohort.
 
-    Stratifying within cohort keeps every client's local class balance stable
-    across folds (necessary because METS+ has 94 positives out of 147 while
-    AKRIBEA has 93 out of 11,159) and still yields a valid stratified partition
-    of the pooled data for the unified arm.
+def assign_folds(df: pd.DataFrame, n_folds: int, seed: int) -> pd.Series:
+    """Fold labels, stratified by class within each cohort.
+
+    Every client keeps its class balance across folds, and fold k of the pooled data
+    is the union of the clients' folds k.
     """
     folds = pd.Series(-1, index=df.index, dtype="int8")
 
@@ -54,6 +49,7 @@ def assign_folds(df: pd.DataFrame, n_folds: int, seed: int) -> pd.Series:
         raise RuntimeError("some subjects were not assigned to a fold")
     return folds
 
+
 def split_fold(
     df: pd.DataFrame,
     folds: pd.Series,
@@ -61,12 +57,9 @@ def split_fold(
     validation_fraction: float,
     seed: int,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Return (train, validation, test) for one fold.
+    """(train, validation, test) for one fold.
 
-    The validation split is drawn from the training folds and stratified within
-    cohort. Everything that must not see the test fold (early stopping,
-    federated checkpoint selection, the operating threshold) reads from
-    ``validation``.
+    The validation split is taken from the training folds, by cohort and class.
     """
     test = df.loc[folds == test_fold]
     pool = df.loc[folds != test_fold]
@@ -89,13 +82,15 @@ def split_fold(
     train = pool.drop(index=validation.index)
     return train, validation, test
 
+
 def features(df: pd.DataFrame) -> pd.DataFrame:
-    """The 22 biomarkers, in canonical order. Metadata never reaches the model."""
+    """The 22 biomarkers, always in the same order."""
     return df[BIOMARKERS]
+
 
 def labels(df: pd.DataFrame) -> pd.Series:
     return df[TARGET]
 
+
 def metadata(df: pd.DataFrame) -> pd.DataFrame:
-    """Columns carried for stratified reporting."""
     return df[[c for c in METADATA if c in df.columns]]

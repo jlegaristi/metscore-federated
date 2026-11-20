@@ -1,48 +1,30 @@
-"""
-Experiment configuration.
-
-Every arm imports its settings from here, so that no cohort list, fold count,
-hyperparameter or path is redefined elsewhere.
-"""
+"""Experiment configuration: paths, the biomarker panel, cohorts and hyperparameters."""
 
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
 
-# --------------------------------------------------------------------------
-# Paths
-# --------------------------------------------------------------------------
-
-import os
-
+# Paths. The three directories can be set through the environment, so that the data
+# can live outside the clone and a grid can be written next to an existing one.
 WORKSPACE = Path(__file__).resolve().parent.parent
-DATA_DIR = WORKSPACE / "data"
-#: Overridable so a grid can be re-run beside an existing one instead of over
-#: it. Set METSCORE_RESULTS_DIR to write elsewhere; the analysis scripts read the same
-#: variable, so they follow whichever grid is selected.
+DATA_DIR = Path(os.environ.get("METSCORE_DATA_DIR", WORKSPACE / "data"))
 RESULTS_DIR = Path(os.environ.get("METSCORE_RESULTS_DIR", WORKSPACE / "results"))
+# tables/ and figures/ are written under this one
+OUTPUT_DIR = Path(os.environ.get("METSCORE_OUTPUT_DIR", WORKSPACE))
 
-# Original (read-only) data location. The first-submission experiment folders
-# under approach_analysis_cv/ are deliberately never written to.
+# Where scripts/prepare_data.py looks for the source files of the cohorts.
 SOURCE_DATA = (WORKSPACE.parent.parent.parent / "data").resolve()
 
-# --------------------------------------------------------------------------
-# Features
-# --------------------------------------------------------------------------
-
-#: Spreadsheet mapping every candidate NMR variable to its hierarchical cluster
-#: and marking the 22 selected representatives. This is the feature selection of
-#: the original MetSCORE study (Gil-Redondo 2024); `scripts/prepare_data.py`
-#: reads it directly, so the panel is derived from source rather than inherited
-#: from opaque intermediate files.
+# Spreadsheet of the original MetSCORE study (Gil-Redondo et al., 2024) listing every
+# candidate NMR variable, its cluster and the 22 that were selected.
 SELECTION_FILE = "clusters_of_variables_with_final_selection.xlsx"
 
-#: Lipoprotein parameters. Each is one representative NMR variable renamed to its
-#: cluster label, e.g. the raw column ``L5TG`` is reported as ``LDLs 4-5``.
-#: Selection and renaming both come from SELECTION_FILE; nothing is aggregated.
+# The panel. Each entry is one NMR variable, named after its cluster where the study
+# renamed it (the raw column L5TG is "LDLs 4-5").
 LIPOPROTEINS = [
     "LDLs 4-5",
     "HDLs 1-3 noTGs",
@@ -53,7 +35,6 @@ LIPOPROTEINS = [
     "LDLs 6",
 ]
 
-#: Metabolites and metabolite ratios.
 METABOLITES = [
     "Ala-Tyr",
     "Citric acid",
@@ -72,24 +53,16 @@ METABOLITES = [
     "Trimethylamine-N-oxide",
 ]
 
-#: The 22-biomarker panel validated in the original MetSCORE study. Held fixed
-#: across all arms so that the comparison isolates the training paradigm.
 BIOMARKERS = LIPOPROTEINS + METABOLITES
 
 TARGET = "metS"
 
-#: Metadata carried alongside the biomarkers. Needed for the stratified results
-#:
-#: Coverage is complete for DISCOVERY. In the external cohort it is partial and
-#: differs by site: BPH has age, sex and bmi; GRAZ has sex only; TUEBINGEN has
-#: bmi only, so external stratification is reported over the sites that carry
-#: the variable, with the covered fraction stated.
+# Columns kept next to the biomarkers for the stratified results. DISCOVERY has all of
+# them. In the external cohort BPH has age, sex and bmi, GRAZ only sex and TUEBINGEN
+# only bmi.
 METADATA = ["cohort", "site", "age", "sex", "bmi", "metS_profile"]
 
-# --------------------------------------------------------------------------
-# Cohorts
-# --------------------------------------------------------------------------
-
+# Cohorts: file stem -> name used in the paper
 COHORTS = {
     "akribea": "AKRIBEA",
     "osarten": "OSARTEN",
@@ -98,7 +71,7 @@ COHORTS = {
     "metsplus": "METS+",
 }
 
-#: that a silent change to a source file cannot pass unnoticed.
+# Expected sizes, checked when the data snapshot is built.
 COHORT_SIZES = {
     "AKRIBEA": 11159,
     "OSARTEN": 8142,
@@ -109,9 +82,7 @@ COHORT_SIZES = {
 
 DISCOVERY_N = 20662
 
-#: The three VALIDATION sub-cohorts, each in its own source spreadsheet.
-#: Prevalence varies enormously between them, 2.9% in GRAZ against 77.6% in
-#: TUEBINGEN, so a single pooled external AUROC conceals more than it reports.
+# The three sites of the VALIDATION cohort, one spreadsheet each.
 EXTERNAL_SITES = {
     "BPH": "validation_BPH_glucose110_20240411.xlsx",
     "GRAZ": "validation_GRAZ_glucose110_20240411.xlsx",
@@ -121,70 +92,64 @@ EXTERNAL_SITES = {
 EXTERNAL_SITE_SIZES = {"BPH": 324, "GRAZ": 279, "TUEBINGEN": 58}
 EXTERNAL_N = 661
 
-# --------------------------------------------------------------------------
-# --------------------------------------------------------------------------
 
 class ScalingContract(str, Enum):
-    """How features are standardized at evaluation time."""
+    """How external features are standardized before scoring."""
 
-    #: PRIMARY. Apply the scaler fitted on training data. The only contract that
-    #: can score a single patient without seeing the rest of the cohort.
+    # With the scaler fitted on the training data. Works for a single patient.
     TRAIN_FITTED = "train_fitted"
 
-    #: SECONDARY. Re-standardize using statistics estimated from a *reference
-    #: split* held out at the target site, then applied to the scored samples.
-    #: Legitimate domain adaptation; reported for every arm or for none.
+    # With statistics of the target site, estimated on a reference split that is
+    # then left out of the scoring.
     SITE_ADAPTED = "site_adapted"
 
-    # A pooled/transductive contract (fitting on the scored samples themselves)
-    # is deliberately not representable here.
 
-#: Fraction of a target site's data reserved to estimate SITE_ADAPTED statistics.
-#: These rows are excluded from scoring, so the contract stays non-transductive.
+# Share of a target site used as the reference split of SITE_ADAPTED.
 SITE_REFERENCE_FRACTION = 0.3
 
-# --------------------------------------------------------------------------
-# Experiment configuration
-# --------------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class ModelConfig:
-    """The architecture shared by every arm."""
+    """The network, the same in every arm."""
 
     hidden_units: tuple[int, ...] = (128, 96, 64, 32)
     dropout: tuple[float, ...] = (0.35, 0.30, 0.25, 0.20)
-    batch_norm: bool = True
+    # "batch" or "layer". The differentially private runs need "layer", because the
+    # running statistics of batch normalization cannot take noise.
+    normalization: str = "batch"
     l1: float = 1e-4
     l2: float = 1e-4
     learning_rate: float = 1e-3
     activation: str = "relu"
     kernel_initializer: str = "he_normal"
 
+
 @dataclass(frozen=True)
 class ImbalanceConfig:
-    """One convention for the whole study."""
-
     downsample: bool = True
     majority_to_minority_ratio: float = 5.0
-    #: Below this many minority samples, downsampling is skipped entirely.
+    # no downsampling below this many minority samples
     min_minority: int = 10
     class_weights_after_downsampling: bool = True
+    # Centralized arm only: downsample every cohort on its own, as the federated
+    # clients do, instead of the pooled training data (sensitivity analysis).
+    within_cohort: bool = False
+
 
 @dataclass(frozen=True)
 class CVConfig:
     repetitions: int = 10
     folds: int = 5
     seed: int = 42
-    #: Fraction of the training folds held out for validation. Model selection,
-    #: early stopping and threshold selection all read from this split, never
-    #: from the test fold.
+    # Share of the training folds held out as validation: early stopping, the choice
+    # of federated round and the threshold all use it, never the test fold.
     validation_fraction: float = 0.2
+
 
 @dataclass(frozen=True)
 class ThresholdConfig:
-    """Where the operating point comes from (fix for F4)."""
+    """How the operating point is chosen."""
 
-    #: Selection data. "test" is intentionally not an accepted value.
     source: str = "validation"
     criterion: str = "youden"
     resolution: int = 1000
@@ -194,9 +159,9 @@ class ThresholdConfig:
     def __post_init__(self) -> None:
         if self.source != "validation":
             raise ValueError(
-                "Threshold selection must read from validation data (F4). "
-                f"Got source={self.source!r}."
+                f"the threshold is chosen on validation data, got source={self.source!r}"
             )
+
 
 @dataclass(frozen=True)
 class TrainConfig:
@@ -207,6 +172,7 @@ class TrainConfig:
     reduce_lr_factor: float = 0.2
     min_lr: float = 1e-5
 
+
 @dataclass(frozen=True)
 class FederatedConfig:
     num_rounds: int = 20
@@ -214,19 +180,21 @@ class FederatedConfig:
     fraction_fit: float = 1.0
     fraction_evaluate: float = 1.0
     checkpoint_selection: str = "federated_validation"
+    # Adam starts every round from its initial state.
+    reset_optimizer_each_round: bool = True
 
     def __post_init__(self) -> None:
         allowed = {"federated_validation", "final_round"}
         if self.checkpoint_selection not in allowed:
             raise ValueError(
-                "Federated checkpoint may not be selected on the test folds (F2). "
-                f"Expected one of {sorted(allowed)}, got "
-                f"{self.checkpoint_selection!r}."
+                f"checkpoint_selection must be one of {sorted(allowed)}, "
+                f"got {self.checkpoint_selection!r}"
             )
+
 
 @dataclass(frozen=True)
 class ExperimentConfig:
-    """Everything an arm needs, serialisable for provenance."""
+    """One run: an arm, a strategy and the settings above."""
 
     name: str
     arm: str  # "unified" | "individual" | "federated"
@@ -237,9 +205,11 @@ class ExperimentConfig:
     threshold: ThresholdConfig = field(default_factory=ThresholdConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
     federated: FederatedConfig = field(default_factory=FederatedConfig)
-    #: Aggregation strategy, federated arm only.
+    # aggregation strategy (federated arm) and its parameters
     strategy: str = "fedavg"
     strategy_params: dict = field(default_factory=dict)
+    # tells apart runs of one strategy that differ in some other setting
+    variant: str = ""
 
     def to_dict(self) -> dict:
         d = asdict(self)

@@ -1,9 +1,8 @@
-"""
-The network, built identically by every arm.
+"""The network used by every arm.
 
-Four hidden layers of 128, 96, 64 and 32 units, each with ReLU activation, He
-normal initialization, L1/L2 regularization, batch normalization and dropout
-decreasing with depth, followed by a single sigmoid output.
+Four hidden layers (128, 96, 64, 32) with ReLU, He initialization, L1/L2 penalties,
+batch normalization and dropout, and a sigmoid output. The differentially private
+runs replace batch normalization by layer normalization.
 """
 
 from __future__ import annotations
@@ -12,14 +11,11 @@ import numpy as np
 
 from .config import ModelConfig
 
-def build(input_dim: int, cfg: ModelConfig | None = None):
-    """Compile the MetSCORE classifier.
 
-    Imported by every arm. If an arm needs a different network, that is a change
-    to ModelConfig, not a second definition elsewhere.
-    """
+def build(input_dim: int, cfg: ModelConfig | None = None):
+    """Build and compile the classifier."""
     import keras
-    from keras.layers import BatchNormalization, Dense, Dropout, Input
+    from keras.layers import BatchNormalization, Dense, Dropout, Input, LayerNormalization
     from keras.models import Sequential
     from keras.optimizers import Adam
     from keras.regularizers import l1_l2
@@ -38,8 +34,12 @@ def build(input_dim: int, cfg: ModelConfig | None = None):
                 kernel_initializer=cfg.kernel_initializer,
             )
         )
-        if cfg.batch_norm:
+        if cfg.normalization == "batch":
             layers.append(BatchNormalization())
+        elif cfg.normalization == "layer":
+            layers.append(LayerNormalization())
+        else:
+            raise ValueError(f"unknown normalization: {cfg.normalization!r}")
         layers.append(Dropout(drop))
 
     layers.append(Dense(1, activation="sigmoid"))
@@ -52,16 +52,17 @@ def build(input_dim: int, cfg: ModelConfig | None = None):
     )
     return model
 
+
 def parameter_count(input_dim: int, cfg: ModelConfig | None = None) -> int:
-    """Trainable parameters, the figure quoted as the size of the model."""
+    """Number of trainable parameters."""
     return int(sum(np.prod(w.shape) for w in build(input_dim, cfg).trainable_weights))
 
-def transmitted_parameter_count(input_dim: int, cfg: ModelConfig | None = None) -> int:
-    """Every value that crosses the wire, which feeds the communication cost.
 
-    FedAvg sends `get_weights()`, so the batch normalization running statistics
-    travel with the trainable weights and are averaged along with them. Counting
-    only the trainable parameters understates the traffic by 2.6%.
+def transmitted_parameter_count(input_dim: int, cfg: ModelConfig | None = None) -> int:
+    """Number of values exchanged per update, for the communication cost.
+
+    FedAvg sends `get_weights()`, which includes the running statistics of batch
+    normalization on top of the trainable weights.
     """
     net = build(input_dim, cfg)
     return int(sum(np.prod(w.shape)

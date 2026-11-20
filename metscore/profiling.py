@@ -1,16 +1,8 @@
-"""
-Cost accounting.
+"""Cost of a run: communication, client compute and wall-clock time.
 
-Three quantities, reported separately because they scale differently:
-
-  communication   bytes on the wire, derived analytically from the protocol
-  compute         summed client training time
-  wall-clock      elapsed time per round
-
-Communication is derived rather than measured: in a simulation every client is
-the same process, so a measured figure would describe the harness rather than a
-federation spanning five countries. The analytic figure is exact for the
-protocol, being parameter count x 4 bytes x 2 directions x rounds x clients.
+Communication is computed from the protocol (values sent x 4 bytes x 2 directions x
+rounds x clients) rather than measured, because in this simulation all clients run
+in one process.
 """
 
 from __future__ import annotations
@@ -21,6 +13,7 @@ from dataclasses import asdict, dataclass, field
 
 BYTES_PER_FLOAT32 = 4
 
+
 @dataclass
 class CommunicationCost:
     n_parameters: int
@@ -30,7 +23,7 @@ class CommunicationCost:
 
     @property
     def per_client_per_round_bytes(self) -> int:
-        """Down (global model) plus up (local update): two full parameter sets."""
+        """Global model down plus local update up."""
         return 2 * self.n_parameters * self.bytes_per_parameter
 
     @property
@@ -54,16 +47,13 @@ class CommunicationCost:
         }
 
     def transfer_seconds(self, mbps: float) -> float:
-        """Wall-clock cost of the parameter exchange on a given link.
-
-        Reported for a plausible inter-institutional link so the overhead can be
-        judged against training time rather than quoted as a bare byte count.
-        """
+        """Time the whole exchange would take on a link of `mbps`."""
         return self.total_bytes * 8 / (mbps * 1e6)
+
 
 @dataclass
 class Timer:
-    """Accumulates named durations across a run."""
+    """Named durations, accumulated over a run."""
 
     durations: dict[str, float] = field(default_factory=dict)
     counts: dict[str, int] = field(default_factory=dict)
@@ -88,9 +78,10 @@ class Timer:
             for label, total in sorted(self.durations.items())
         }
 
+
 @dataclass
 class RunProfile:
-    """What every run records, federated or not, so the arms stay comparable."""
+    """What is saved in profile.json, for every arm."""
 
     arm: str
     wall_clock_s: float
@@ -111,12 +102,9 @@ class RunProfile:
             d["round_s_max"] = round(max(rounds), 3)
         return d
 
-def compare(federated: RunProfile, centralised: RunProfile) -> dict:
-    """Federated overhead relative to centralised training.
 
-    Federation costs wall-clock time and bandwidth, and buys the ability to
-    train without moving patient data. Both sides of that trade are reported.
-    """
+def compare(federated: RunProfile, centralised: RunProfile) -> dict:
+    """Wall-clock and communication of a federated run next to a centralized one."""
     ratio = (
         federated.wall_clock_s / centralised.wall_clock_s
         if centralised.wall_clock_s

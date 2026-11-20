@@ -1,15 +1,14 @@
-"""
-Launch the experiment grid.
+"""Run the experiment grid.
 
-Every job is one (arm, strategy, scaling contract) run, executed in its own
-single-threaded process with the GPU hidden; see `metscore/runtime.py`.
+Each job is one run (an arm and a strategy), in its own single-threaded process with
+the GPU hidden (see `metscore/runtime.py`).
 
     python scripts/run_experiments.py --list
     python scripts/run_experiments.py --smoke
     python scripts/run_experiments.py --only unified,federated
     python scripts/run_experiments.py --workers 12
 
-Results land in `results/<run_id>/`; `results/index.csv` tracks what has run.
+Results go to `results/<run_id>/` and `results/index.csv` lists the finished runs.
 """
 
 from __future__ import annotations
@@ -19,7 +18,7 @@ import signal
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 WORKSPACE = Path(__file__).resolve().parent.parent
@@ -27,12 +26,12 @@ sys.path.insert(0, str(WORKSPACE))
 
 from metscore import runtime  # noqa: E402
 from metscore.config import (  # noqa: E402
-    COHORTS, RESULTS_DIR, CVConfig, ScalingContract,
+    COHORTS, DATA_DIR, RESULTS_DIR, CVConfig, ScalingContract,
 )
 
-#: Runs record every contract; the field survives only to name the primary one
-#: in the saved config, since both are present in the metrics table.
+# Every run saves both scaling contracts; this is only the one named in config.json.
 BOTH_CONTRACTS = ScalingContract.TRAIN_FITTED.value
+
 
 @dataclass(frozen=True)
 class Job:
@@ -41,44 +40,47 @@ class Job:
     scaling: str
     params: dict
     cohort: str | None = None
+    variant: str = ""
+    model: dict = field(default_factory=dict)
+    federated: dict = field(default_factory=dict)
+    imbalance: dict = field(default_factory=dict)
 
     @property
     def run_id(self) -> str:
         parts = [self.arm, self.strategy]
         if self.params:
             parts.append("_".join(f"{k}{v}" for k, v in sorted(self.params.items())))
+        if self.variant:
+            parts.append(self.variant)
         return "__".join(parts)
 
     @property
     def label(self) -> str:
         extra = f" {self.params}" if self.params else ""
-        return f"{self.arm}/{self.strategy}{extra}"
+        variant = f" [{self.variant}]" if self.variant else ""
+        return f"{self.arm}/{self.strategy}{extra}{variant}"
+
 
 def build_grid() -> list[Job]:
-    """The full set of runs behind the revision."""
+    """All the runs of the paper."""
     federated_strategies = [
         ("fedavg", {}),
         ("fedavg_uniform", {}),
+        ("fedavg_cohort", {}),
         ("fedprox", {"mu": 0.01}),
         ("fedprox", {"mu": 0.1}),
         ("fedprox", {"mu": 1.0}),
         ("fedmedian", {}),
         ("fedtrimmed", {}),
-        # The noise sweep spans the trade-off deliberately. Utility has
-        # collapsed by a multiplier of 1.0, while a meaningful guarantee
-        # (epsilon <= 10 at delta = 1e-5, over 20 rounds of full participation)
-        # needs about 2.4, so the two ends do not overlap. With five silos there
-        # is no amplification by subsampling, which is what makes differential
-        # privacy affordable in cross-device federations.
-        ("dp_fedavg", {"noise_multiplier": 0.1}),
-        ("dp_fedavg", {"noise_multiplier": 0.5}),
-        ("dp_fedavg", {"noise_multiplier": 1.0}),
-        ("dp_fedavg", {"noise_multiplier": 2.0}),
-        ("dp_fedavg", {"noise_multiplier": 4.0}),
-        ("dp_fedavg", {"noise_multiplier": 8.0}),
     ]
 
     jobs: list[Job] = [Job("unified", "centralised", BOTH_CONTRACTS, {})]
+    # The centralized model on the samples the federated clients train on: every
+    # cohort downsampled on its own instead of the pooled data.
+    jobs.append(
+        Job("unified", "centralised", BOTH_CONTRACTS, {},
+            variant="cohort-downsampling", imbalance={"within_cohort": True})
+    )
     jobs += [
         Job("individual", cohort, BOTH_CONTRACTS, {}, cohort=cohort)
         for cohort in COHORTS.values()
@@ -87,7 +89,35 @@ def build_grid() -> list[Job]:
         Job("federated", strategy, BOTH_CONTRACTS, params)
         for strategy, params in federated_strategies
     ]
+
+    # FedAvg and FedProx keeping the state of Adam between rounds, as a sensitivity
+    # analysis.
+    persistent = {"reset_optimizer_each_round": False}
+    jobs += [
+        Job("federated", "fedavg", BOTH_CONTRACTS, {},
+            variant="adam-persistent", federated=persistent),
+        Job("federated", "fedprox", BOTH_CONTRACTS, {"mu": 0.1},
+            variant="adam-persistent", federated=persistent),
+    ]
+
+    # Differential privacy. These runs use layer normalization and keep the model of
+    # the last round (see metscore/privacy.py). The reference run has no noise and a
+    # clipping bound that is never reached: it gives the AUROC of this architecture
+    # without privacy and the update norms from which the clipping bound was chosen.
+    private = {
+        "model": {"normalization": "layer"},
+        "federated": {"checkpoint_selection": "final_round"},
+    }
+    jobs.append(
+        Job("federated", "dp_fedavg", BOTH_CONTRACTS,
+            {"noise_multiplier": 0.0, "clipping_norm": 1e9}, variant="reference", **private)
+    )
+    jobs += [
+        Job("federated", "dp_fedavg", BOTH_CONTRACTS, {"noise_multiplier": z}, **private)
+        for z in (0.1, 0.5, 1.0, 2.0, 4.0, 8.0)
+    ]
     return jobs
+
 
 CHILD = r'''
 import json, sys
@@ -99,7 +129,8 @@ runtime.configure_worker(threads=1, use_gpu=False)
 runtime.apply_tensorflow_threading(1)
 
 from metscore.config import (
-    CVConfig, ExperimentConfig, FederatedConfig, ScalingContract, TrainConfig,
+    CVConfig, ExperimentConfig, FederatedConfig, ImbalanceConfig, ModelConfig,
+    ScalingContract, TrainConfig,
 )
 from metscore.arms import centralised, federated
 
@@ -109,10 +140,13 @@ cfg = ExperimentConfig(
     arm=spec["arm"],
     strategy=spec["strategy"],
     strategy_params=spec["params"],
+    variant=spec["variant"],
     scaling=ScalingContract(spec["scaling"]),
+    model=ModelConfig(**spec["model"]),
+    imbalance=ImbalanceConfig(**spec["imbalance"]),
     cv=CVConfig(**overrides.get("cv", {})),
     train=TrainConfig(**overrides.get("train", {})),
-    federated=FederatedConfig(**overrides.get("federated", {})),
+    federated=FederatedConfig(**{**overrides.get("federated", {}), **spec["federated"]}),
 )
 
 reps = overrides.get("repetitions")
@@ -124,13 +158,15 @@ else:
     centralised.run_unified(cfg, repetitions=reps)
 '''
 
+
 def launch(job: Job, overrides: dict) -> subprocess.Popen:
     import json
 
     payload = {
         "run_id": job.run_id, "arm": job.arm, "strategy": job.strategy,
         "scaling": job.scaling, "params": job.params, "cohort": job.cohort,
-        "overrides": overrides,
+        "variant": job.variant, "model": job.model, "federated": job.federated,
+        "imbalance": job.imbalance, "overrides": overrides,
     }
     log = RESULTS_DIR / "logs" / f"{job.run_id}.log"
     log.parent.mkdir(parents=True, exist_ok=True)
@@ -140,13 +176,12 @@ def launch(job: Job, overrides: dict) -> subprocess.Popen:
         stdout=handle, stderr=subprocess.STDOUT,
     )
 
-def already_done(job: Job, expected_folds: int | None = None) -> bool:
-    """A run counts as done only if it is *complete*.
 
-    Checking for the file alone is not enough: a short verification run writes a
-    perfectly valid metrics.csv with one repetition, and the grid then skips the
-    real job silently. Comparing the recorded fold count against what was asked
-    for catches that, and also catches a run truncated by an OOM kill.
+def already_done(job: Job, expected_folds: int | None = None) -> bool:
+    """Whether a run has finished, with all its folds if `expected_folds` is given.
+
+    A smoke run or a killed run also leaves a metrics.csv, so its presence is not
+    enough to skip the job.
     """
     path = RESULTS_DIR / job.run_id / "metrics.csv"
     if not path.exists():
@@ -164,10 +199,14 @@ def already_done(job: Job, expected_folds: int | None = None) -> bool:
     observed = frame.loc[frame["evaluation"] == "cv", ["repetition", "fold"]]
     return len(observed.drop_duplicates()) >= expected_folds
 
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--workers", type=int, default=runtime.recommended_workers())
     parser.add_argument("--only", default="", help="comma-separated arms to run")
+    parser.add_argument(
+        "--match", default="", help="comma-separated substrings of run ids to run",
+    )
     parser.add_argument(
         "--repetitions", type=int, default=None,
         help="override CV repetitions, use 3 for a fast first pass",
@@ -178,6 +217,10 @@ def main() -> None:
         help="report which runs are finished and exit, safe while a grid runs",
     )
     parser.add_argument("--force", action="store_true", help="re-run completed jobs")
+    parser.add_argument(
+        "--allow-dirty", action="store_true",
+        help="run although metscore/ or scripts/ have uncommitted changes",
+    )
     parser.add_argument(
         "--smoke", action="store_true",
         help="1 repetition, few rounds and epochs, verifies the grid runs",
@@ -204,7 +247,7 @@ def main() -> None:
 
     missing = [
         name for name in ("discovery.csv", "external.csv")
-        if not (WORKSPACE / "data" / name).exists()
+        if not (DATA_DIR / name).exists()
     ]
     if missing:
         sys.exit(
@@ -214,10 +257,24 @@ def main() -> None:
             "only needs doing once."
         )
 
+    from metscore.results import code_version
+
+    version = code_version()
+    untraceable = version["git_commit"] is None or version["git_dirty"]
+    if untraceable and not (args.allow_dirty or args.smoke):
+        sys.exit(
+            "metscore/ or scripts/ have uncommitted changes, or this is not a git clone,\n"
+            "so these runs could not be traced to a commit. Commit first, or pass\n"
+            "--allow-dirty for a throwaway run."
+        )
+
     jobs = build_grid()
     if args.only:
         wanted = {a.strip() for a in args.only.split(",")}
         jobs = [j for j in jobs if j.arm in wanted]
+    if args.match:
+        patterns = [m.strip() for m in args.match.split(",")]
+        jobs = [j for j in jobs if any(pattern in j.run_id for pattern in patterns)]
 
     overrides = {}
     if args.repetitions is not None:
@@ -258,11 +315,7 @@ def main() -> None:
     stopping = False
 
     def stop(signum, _frame):
-        """Ctrl-C or SIGTERM: take the workers down with us.
-
-        Without this the children outlive the parent and keep burning CPU quota
-        on a shared host with nothing collecting their results.
-        """
+        """On Ctrl-C or SIGTERM, stop the workers too."""
         nonlocal stopping
         if stopping:
             return
@@ -303,8 +356,7 @@ def main() -> None:
                     flush=True,
                 )
 
-        # A long grid can go a while with nothing finishing; say so, otherwise a
-        # detached log looks indistinguishable from a hung process.
+        # print something every ten minutes, so the log shows the grid is alive
         if time.perf_counter() - last_heartbeat > 600:
             last_heartbeat = time.perf_counter()
             print(
@@ -327,6 +379,7 @@ def main() -> None:
         for job in failed:
             print(f"  {job.run_id}")
         sys.exit(1)
+
 
 if __name__ == "__main__":
     main()

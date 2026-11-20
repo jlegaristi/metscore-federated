@@ -1,20 +1,22 @@
-"""
-Federated training arm.
+"""Federated training.
 
-Each cohort is a client holding its own data, its own scaler and its own
-validation split. Rounds proceed as in FedAvg: the server broadcasts weights,
-clients train locally, and the server aggregates through `strategies`.
+Each cohort is a client with its own training and validation split. Before the first
+round every client sends the count, mean and variance of its training features; the
+server pools them into one scaler that all clients use for training and validation,
+and that the global model uses afterwards. Then, in every round, the server sends the
+weights, the clients train locally and the server aggregates their updates with the
+rule in `strategies`.
 
-The checkpoint kept is the one with the best federated validation score, the
-sample-weighted mean of each client's local validation AUROC. Batch
-normalization statistics travel with the weights and are averaged with them.
-The global scaler is pooled exactly from each client's (mean, variance, count),
-so no record-level value is exchanged.
+The model kept is that of the round with the best federated validation score: the
+mean of the clients' validation AUROCs, weighted by their validation sizes. The
+running statistics of batch normalization are sent and averaged with the weights.
+Clients only send weights and aggregate statistics, never records.
 """
 
 from __future__ import annotations
 
 import time
+import zlib
 
 import numpy as np
 import pandas as pd
@@ -26,20 +28,22 @@ from .. import (
 from ..config import BIOMARKERS, TARGET, ExperimentConfig, ScalingContract
 from .centralised import _external_sets, _record_strata
 
-class Client:
-    """One participating institution."""
 
-    def __init__(self, name, train, validation, cfg, seed):
+class Client:
+    """One institution."""
+
+    def __init__(self, name, train, validation, scaler, cfg, seed, n_clients):
         self.name = name
         self.cfg = cfg
         self.seed = seed
+        self.n_clients = n_clients
+        self.noise_rng = np.random.default_rng([seed, zlib.crc32(name.encode())])
+        self.update_norms: list[float] = []
+        # the federated scaler, the same for every client
+        self.scaler = scaler
 
         x_train = data_mod.features(train).to_numpy()
         y_train = data_mod.labels(train).to_numpy()
-
-        # Per-site normalisation: statistics never leave this client except as
-        # the aggregate used to build the global scaler.
-        self.scaler = scaling.fit_training_scaler(x_train)
         x_scaled = scaling.transform_internal(self.scaler, x_train)
 
         self.x, self.y, self.class_weight, _ = imbalance.prepare_training_set(
@@ -51,45 +55,49 @@ class Client:
             self.scaler, data_mod.features(validation).to_numpy()
         )
         self.y_val = data_mod.labels(validation).to_numpy()
-        self.n = len(self.x)
+        self.n = len(self.x)  # samples it trains on, after downsampling
+        self.n_cohort = len(y_train)  # training cohort, before downsampling
 
-        # Built once. Compiling a Keras model costs far more than a local epoch
-        # at this size, and a client is asked to train once per round for every
-        # round of every fold, rebuilding it each time dominated the runtime.
+        # built once per client: compiling the model takes longer than a round
         self.net = model.build(len(BIOMARKERS), self.cfg.model)
-        self.proximal = None
+        self.trainer = None
 
     def fit(self, global_weights, spec: strategies.StrategySpec):
-        """One round of local training. Returns weights, sample count, seconds."""
+        """One round of local training. Returns the weights, n and the seconds it took."""
         net = self.net
         net.set_weights(global_weights)
 
         started = time.perf_counter()
-        if spec.proximal_mu > 0:
-            if self.proximal is None:
-                self.proximal = ProximalTrainer(
-                    net, self.x, self.y, spec.proximal_mu,
-                    self.cfg.train.batch_size, self.class_weight,
-                )
-            self.proximal.run(self.cfg.federated.local_epochs)
-        else:
-            net.fit(
-                self.x, self.y,
-                epochs=self.cfg.federated.local_epochs,
-                batch_size=self.cfg.train.batch_size,
-                class_weight=self.class_weight,
-                verbose=0,
+        if self.trainer is None:
+            self.trainer = LocalTrainer(
+                net, self.x, self.y, spec.proximal_mu,
+                self.cfg.train.batch_size, self.class_weight, self.seed,
             )
+        if self.cfg.federated.reset_optimizer_each_round:
+            self.trainer.reset_optimizer()
+        self.trainer.run(self.cfg.federated.local_epochs)
         elapsed = time.perf_counter() - started
-        return net.get_weights(), self.n, elapsed
+
+        weights = net.get_weights()
+        if spec.privacy is not None:
+            if net.non_trainable_weights:
+                raise ValueError(
+                    "differential privacy needs a model without running statistics; "
+                    "use normalization='layer'"
+                )
+            weights, norm = privacy.privatise_update(
+                weights, global_weights,
+                spec.privacy.clipping_norm, spec.privacy.noise_multiplier,
+                self.n_clients, self.noise_rng,
+            )
+            self.update_norms.append(norm)
+        return weights, self.n, elapsed
 
     def validation_score(self, weights) -> tuple[float, int]:
-        """Local validation AUROC. The only signal used to pick a checkpoint.
+        """AUROC of `weights` on the client's validation split, and its size.
 
-        Returns NaN if the model has diverged. That is not an error condition to
-        be swallowed: under enough differential-privacy noise the global model
-        does blow up, and the run should record the collapse as a point on the
-        privacy-utility curve rather than crash and lose the whole sweep.
+        NaN if the predictions are not finite, which happens with strong
+        differential-privacy noise.
         """
         from sklearn.metrics import roc_auc_score
 
@@ -102,24 +110,20 @@ class Client:
             return float("nan"), 0
         return float(roc_auc_score(self.y_val, scores)), len(self.y_val)
 
-class ProximalTrainer:
-    """FedProx local training: local loss plus (mu/2) * ||w - w_global||^2.
 
-    Li et al. (2020). The term restrains clients from drifting far from the
-    global model during local training, which is what makes it worth testing on
-    data as heterogeneous as this: MetS prevalence spans 0.83% to 63.95% across
-    clients, so unconstrained local epochs pull hard in five directions.
+class LocalTrainer:
+    """Local training loop, the same for every aggregation strategy.
 
-    Built once per client and reused across rounds. Tracing a fresh
-    `tf.function` on every call (which is what happens if the decorator sits
-    inside the training function) retains one traced graph per call. Over
-    10 repetitions x 5 folds x 20 rounds x 5 clients that is 5,000 retained
-    graphs, and it exhausted a 96 GB container part-way through an overnight
-    run. The global weights are held in reassignable variables so each round
-    updates values rather than triggering a retrace.
+    Minimizes the class-weighted binary cross-entropy plus the L1/L2 penalties of
+    the network plus (mu/2) * ||w - w_global||^2. mu is zero except for FedProx
+    (Li et al., 2020), so the strategies share the rest of the objective.
+
+    One trainer per client, reused in every round: the training step is a
+    `tf.function` traced once, and the global weights are kept in variables that are
+    reassigned each round.
     """
 
-    def __init__(self, net, x, y, mu, batch_size, class_weight):
+    def __init__(self, net, x, y, mu, batch_size, class_weight, shuffle_seed):
         import tensorflow as tf
 
         self.net = net
@@ -135,46 +139,115 @@ class ProximalTrainer:
             tf.data.Dataset.from_tensor_slices(
                 (x.astype("float32"), y.astype("float32"), sample_weight)
             )
-            .shuffle(len(x), seed=0, reshuffle_each_iteration=True)
+            .shuffle(len(x), seed=shuffle_seed, reshuffle_each_iteration=True)
             .batch(batch_size)
         )
 
-        # Trainable weights only: the proximal term is defined over parameters
-        # the optimiser moves, not over batch-norm running statistics.
+        # the proximal term is over the trainable weights, not over the running
+        # statistics of batch normalization
         self.reference = [
             tf.Variable(w, trainable=False, dtype=tf.float32)
             for w in net.trainable_weights
         ]
-        self.loss_fn = tf.keras.losses.BinaryCrossentropy()
         self.step = tf.function(self._step, reduce_retracing=True)
 
-    def _step(self, xb, yb, wb):
+        optimizer = net.optimizer
+        if not optimizer.built:
+            optimizer.build(net.trainable_variables)
+        self._initial_optimizer_state = [v.numpy() for v in optimizer.variables]
+
+    def reset_optimizer(self):
+        """Put Adam back in its initial state (moments, step count, learning rate)."""
+        for variable, initial in zip(self.net.optimizer.variables, self._initial_optimizer_state):
+            variable.assign(initial)
+
+    def objective(self, xb, yb, wb, training):
+        """The local loss of a batch.
+
+        `compute_loss` is what `Model.fit` minimizes in the centralized arms: the
+        compiled loss with per-sample weights plus the L1/L2 penalties. (Calling the
+        Keras loss directly on 1-D tensors averages over the batch before weighting.)
+        """
         import tensorflow as tf
 
-        with tf.GradientTape() as tape:
-            predictions = tf.squeeze(self.net(xb, training=True), axis=-1)
-            loss = self.loss_fn(yb, predictions, sample_weight=wb)
+        loss = self.net.compute_loss(
+            y=yb, y_pred=self.net(xb, training=training), sample_weight=wb, training=training,
+        )
+        if self.mu > 0:
             proximal = tf.add_n([
                 tf.reduce_sum(tf.square(w - g))
                 for w, g in zip(self.net.trainable_weights, self.reference)
             ])
             loss = loss + (self.mu / 2.0) * proximal
+        return loss
+
+    def _step(self, xb, yb, wb):
+        import tensorflow as tf
+
+        with tf.GradientTape() as tape:
+            loss = self.objective(xb, yb, wb, training=True)
         self.net.optimizer.apply_gradients(
             zip(tape.gradient(loss, self.net.trainable_weights), self.net.trainable_weights)
         )
         return loss
 
-    def run(self, epochs):
-        """One round of local training against the current global weights."""
+    def sync_reference(self):
+        """Use the current weights of the network as w_global."""
         for variable, current in zip(self.reference, self.net.trainable_weights):
-            variable.assign(current)  # net already holds the broadcast weights
+            variable.assign(current)
+
+    def run(self, epochs):
+        """Train for `epochs` epochs from the global weights the network holds."""
+        self.sync_reference()
         for _ in range(epochs):
             for xb, yb, wb in self.dataset:
                 self.step(xb, yb, wb)
 
+
+def federated_scaler(train, cohorts):
+    """The scaler of the federation.
+
+    Each client fits a scaler on its own training split, which amounts to sending a
+    count, a mean and a variance per feature. Pooled, they give the scaler the
+    centralized arm fits on all the training splits together.
+    """
+    return scaling.aggregate_scalers([
+        scaling.fit_training_scaler(
+            data_mod.features(train.loc[train["cohort"] == name]).to_numpy()
+        )
+        for name in cohorts
+    ])
+
+
+def build_clients(train, validation, cfg, seed, cohorts=None):
+    """The clients (cohorts with both classes in training) and the federated scaler."""
+    names = sorted(train["cohort"].unique()) if cohorts is None else cohorts
+    names = [n for n in names if train.loc[train["cohort"] == n, TARGET].nunique() >= 2]
+    if not names:
+        return [], None
+
+    scaler = federated_scaler(train, names)
+    clients = [
+        Client(
+            name,
+            train.loc[train["cohort"] == name],
+            validation.loc[validation["cohort"] == name],
+            scaler, cfg, seed, len(names),
+        )
+        for name in names
+    ]
+    return clients, scaler
+
+
 def run(cfg: ExperimentConfig, repetitions: int | None = None) -> str:
-    """Execute the federated arm end to end and write its results."""
+    """Run the federated arm over all folds and write its results."""
     spec = strategies.build(cfg.strategy, **cfg.strategy_params)
+    if spec.privacy is not None and cfg.federated.checkpoint_selection != "final_round":
+        raise ValueError(
+            "the privacy budget covers the noisy models themselves; choosing among them "
+            "with non-private validation scores falls outside it, so use 'final_round'"
+        )
+    update_norms: list[float] = []
     discovery = data_mod.load_discovery()
     external_sets = _external_sets(data_mod.load_external())
 
@@ -185,7 +258,7 @@ def run(cfg: ExperimentConfig, repetitions: int | None = None) -> str:
     round_times: list[float] = []
     client_compute = 0.0
 
-    # One compiled model reused for every scoring call in every fold.
+    # one model for all the scoring
     evaluator = model.build(len(BIOMARKERS), cfg.model)
 
     for repetition in range(n_reps):
@@ -197,44 +270,44 @@ def run(cfg: ExperimentConfig, repetitions: int | None = None) -> str:
                 discovery, folds, fold, cfg.cv.validation_fraction, seed
             )
 
-            # Seeded per fold, so folds stay independent draws while the run
-            # as a whole is reproducible. Set before any client is built, since
-            # each one initialises its own network.
+            # one seed per fold, set before the clients build their networks
             runtime.seed_everything(seed * 100 + fold)
-            clients = [
-                Client(
-                    name,
-                    train.loc[train["cohort"] == name],
-                    validation.loc[validation["cohort"] == name],
-                    cfg, seed * 100 + fold,
-                )
-                for name in sorted(discovery["cohort"].unique())
-                if train.loc[train["cohort"] == name, TARGET].nunique() >= 2
-            ]
+            clients, global_scaler = build_clients(
+                train, validation, cfg, seed * 100 + fold,
+                cohorts=sorted(discovery["cohort"].unique()),
+            )
             if len(clients) < 2:
                 continue
 
-            # --- federated rounds
-            # Fresh initialisation per fold, matching the centralised arms.
-            # Once per fold is cheap; once per round was what made this slow.
+            counts = [spec.client_weight(c) for c in clients]
+            writer.record_aggregation_weights(repetition, fold, [
+                {
+                    "cohort": c.name,
+                    "n_training": c.n_cohort,
+                    "n_after_downsampling": c.n,
+                    "weight_applied": (
+                        count / sum(counts) if spec.weighting != "none" else float("nan")
+                    ),
+                }
+                for c, count in zip(clients, counts)
+            ])
+
+            # federated rounds, from a fresh initialization
             weights = [
                 np.asarray(w) for w in model.build(len(BIOMARKERS), cfg.model).get_weights()
             ]
-            best = {"score": -np.inf, "weights": weights, "round": 0}
+            best = {"score": -np.inf, "weights": None, "round": None}
 
             for round_index in range(cfg.federated.num_rounds):
                 round_started = time.perf_counter()
                 updates = []
                 for client in clients:
-                    local_weights, n, seconds = client.fit(weights, spec)
-                    updates.append((local_weights, n))
+                    local_weights, _, seconds = client.fit(weights, spec)
+                    updates.append((local_weights, spec.client_weight(client)))
                     client_compute += seconds
 
                 with timer.measure("aggregate"):
-                    if spec.needs_global_weights:
-                        weights = spec.aggregate(updates, global_weights=weights)
-                    else:
-                        weights = spec.aggregate(updates)
+                    weights = spec.aggregate(updates)
 
                 scores = [c.validation_score(weights) for c in clients]
                 valid = [(s, n) for s, n in scores if s == s and n]
@@ -242,6 +315,7 @@ def run(cfg: ExperimentConfig, repetitions: int | None = None) -> str:
                     sum(s * n for s, n in valid) / sum(n for _, n in valid)
                     if valid else float("nan")
                 )
+                writer.record_round(repetition, fold, round_index, federated_score)
                 if (
                     cfg.federated.checkpoint_selection == "federated_validation"
                     and federated_score == federated_score
@@ -254,27 +328,34 @@ def run(cfg: ExperimentConfig, repetitions: int | None = None) -> str:
                     }
                 round_times.append(time.perf_counter() - round_started)
 
+            # If no round had a finite validation score the run has diverged, and
+            # the model of the last round is evaluated (not the initial one).
             final = (
                 best["weights"]
                 if cfg.federated.checkpoint_selection == "federated_validation"
+                and best["weights"] is not None
                 else weights
             )
 
-            # --- the global model, and the federated scaler that goes with it
+            for client in clients:
+                update_norms.extend(client.update_norms)
+
+            # the global model
             net = evaluator
             net.set_weights(final)
-            global_scaler = scaling.aggregate_scalers([c.scaler for c in clients])
 
-            # Operating point from pooled client validation, still not test.
-            x_val = scaling.transform_internal(
-                global_scaler, data_mod.features(validation).to_numpy()
-            )
-            y_val = data_mod.labels(validation).to_numpy()
-            point = evaluation.select_threshold(
-                y_val, net.predict(x_val, verbose=0).ravel(), cfg.threshold
+            # threshold from the validation counts of the clients
+            point = evaluation.select_threshold_from_counts(
+                [
+                    evaluation.threshold_counts(
+                        c.y_val, net.predict(c.x_val, verbose=0).ravel(), cfg.threshold
+                    )
+                    for c in clients
+                ],
+                cfg.threshold,
             )
 
-            # --- cross-validation on the untouched test fold
+            # cross-validation: the test fold
             with timer.measure("evaluate_cv"):
                 x_test = scaling.transform_internal(
                     global_scaler, data_mod.features(test).to_numpy()
@@ -301,15 +382,10 @@ def run(cfg: ExperimentConfig, repetitions: int | None = None) -> str:
                     site=test["cohort"].to_numpy(), subject_index=test.index.to_numpy(),
                 )
 
-            # --- external, under the declared contract
+            # external cohort
             with timer.measure("evaluate_external"):
-                # Both contracts, one trained model. Scaling affects only how
-                # external features are standardised, so re-training per
-                # contract would burn half the compute for identical models.
-                # Three passes from two contracts. TRAIN_FITTED needs nothing
-                # from the target site, so it scores the whole cohort; the third
-                # pass repeats it on the subset SITE_ADAPTED can reach, which is
-                # where the two contracts may fairly be compared.
+                # The same model under both scaling contracts, plus TRAIN_FITTED
+                # on the subjects SITE_ADAPTED can score, to compare the two.
                 passes = [
                     ("external:%s" % ScalingContract.TRAIN_FITTED.value,
                      ScalingContract.TRAIN_FITTED, False),
@@ -351,22 +427,21 @@ def run(cfg: ExperimentConfig, repetitions: int | None = None) -> str:
                         subject_index=pooled.index.to_numpy(),
                     )
 
-    # Report the update-norm distribution so the clipping norm is defensible.
+    # privacy budget and the update norms behind the choice of clipping norm
     clipping_report = None
-    aggregator = getattr(spec, "aggregate", None)
-    if isinstance(aggregator, strategies.DifferentialPrivacy) and aggregator.observed_norms:
-        norms = np.asarray(aggregator.observed_norms)
+    if spec.privacy is not None and update_norms:
+        norms = np.asarray(update_norms)
         budget = privacy.compute_epsilon(
-            noise_multiplier=aggregator.noise_multiplier,
+            noise_multiplier=spec.privacy.noise_multiplier,
             rounds=cfg.federated.num_rounds,
             clients=len(clients),
-            clipping_norm=aggregator.clipping_norm,
+            clipping_norm=spec.privacy.clipping_norm,
         )
         clipping_report = {
             **budget.to_dict(),
             "update_norm_median": round(float(np.median(norms)), 4),
             "update_norm_p90": round(float(np.quantile(norms, 0.9)), 4),
-            "fraction_clipped": round(float((norms > aggregator.clipping_norm).mean()), 4),
+            "fraction_clipped": round(float((norms > spec.privacy.clipping_norm).mean()), 4),
         }
 
     communication = profiling.CommunicationCost(

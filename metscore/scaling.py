@@ -1,19 +1,14 @@
-"""
-Feature standardization under an explicit contract.
+"""Feature standardization.
 
-Two contracts are available and a third is deliberately unrepresentable:
+External data can be standardized in two ways (`ScalingContract`):
 
-  TRAIN_FITTED  (primary)    statistics from training data only, so it may
-                             score every subject at the target site
-  SITE_ADAPTED  (secondary)  statistics from a reference split held out at the
-                             target site, so it may score only the remainder
-  pooled/transductive        not available; fitting on the scored samples
-                             themselves lets a subject contribute to the
-                             baseline against which it is judged
+  TRAIN_FITTED   with the scaler fitted on the training data; every external subject
+                 can be scored. This is the primary analysis.
+  SITE_ADAPTED   with statistics estimated at the target site on a reference split,
+                 which is then left out of the scoring.
 
-Whichever contract is used, it is used for every arm. The two reach different
-numbers of subjects, so they are also compared on the subset both can score,
-recorded as ``external:train_fitted_common``.
+The two score different numbers of subjects, so TRAIN_FITTED is also applied to the
+subjects SITE_ADAPTED can score (saved as `external:train_fitted_common`).
 """
 
 from __future__ import annotations
@@ -26,21 +21,20 @@ from sklearn.preprocessing import StandardScaler
 
 from .config import BIOMARKERS, SITE_REFERENCE_FRACTION, ScalingContract
 
+
 def fit_training_scaler(x_train: pd.DataFrame | np.ndarray) -> StandardScaler:
-    """Fit on training features only. Never sees validation or test data."""
+    """Scaler fitted on training features."""
     scaler = StandardScaler()
     scaler.fit(np.asarray(x_train, dtype="float64"))
     return scaler
 
+
 @dataclass
 class EvaluationSet:
-    """A target cohort partitioned by what each contract is allowed to see.
+    """One external site, split into a reference part and the part to score.
 
-        TRAIN_FITTED takes nothing from the target site, so it is under no such
-        restriction and scores ``everyone``. Withholding the reference rows from it
-        too would cost 30% of the primary external result in order to keep a
-        secondary comparison tidy. The contract comparison is instead made on
-        ``scored``, which both contracts can reach.
+    TRAIN_FITTED needs nothing from the site, so it scores `everyone`; SITE_ADAPTED
+    only `scored`.
     """
 
     scored: pd.DataFrame
@@ -53,8 +47,9 @@ class EvaluationSet:
         return len(self.scored)
 
     def subjects(self, contract) -> pd.DataFrame:
-        """The rows a contract is permitted to score."""
+        """The rows a contract scores."""
         return self.everyone if contract is ScalingContract.TRAIN_FITTED else self.scored
+
 
 def partition_site(
     df: pd.DataFrame,
@@ -62,11 +57,7 @@ def partition_site(
     seed: int,
     reference_fraction: float = SITE_REFERENCE_FRACTION,
 ) -> EvaluationSet:
-    """Split a target site into a reference set and a scored set.
-
-    Stratified on the label so the reference set is representative. Done once,
-    up front, independently of which contract will be applied.
-    """
+    """Split a site into reference and scored subjects, stratified by label."""
     from .config import TARGET
 
     ref_parts = []
@@ -82,16 +73,16 @@ def partition_site(
         everyone=df, site=site,
     )
 
+
 def transform(
     contract: ScalingContract,
     evaluation: EvaluationSet,
     training_scaler: StandardScaler,
     subset: pd.DataFrame = None,
 ) -> np.ndarray:
-    """Standardise under the given contract the rows it is allowed to score.
+    """Standardize the rows of an external site under one contract.
 
-    ``subset`` overrides that choice, so TRAIN_FITTED can also be applied to the
-    smaller set SITE_ADAPTED reaches, which is what makes the two comparable.
+    `subset` replaces the rows the contract would score by default.
     """
     rows = evaluation.subjects(contract) if subset is None else subset
     x_scored = np.asarray(rows[BIOMARKERS], dtype="float64")
@@ -112,11 +103,14 @@ def transform(
 
     raise ValueError(f"unknown contract: {contract!r}")
 
-def aggregate_scalers(scalers: list[StandardScaler]) -> StandardScaler:
-    """Combine per-client scalers into one, exactly, from summary statistics.
 
-            pooled_mean = sum(n_i * mean_i) / sum(n_i)
-            pooled_var  = sum(n_i * (var_i + mean_i^2)) / sum(n_i) - pooled_mean^2
+def aggregate_scalers(scalers: list[StandardScaler]) -> StandardScaler:
+    """Pool per-client scalers into one, from their counts, means and variances.
+
+        mean = sum(n_i * mean_i) / sum(n_i)
+        var  = sum(n_i * (var_i + mean_i^2)) / sum(n_i) - mean^2
+
+    which is the scaler one would fit on the clients' data put together.
     """
     if not scalers:
         raise ValueError("no scalers to aggregate")
@@ -135,18 +129,15 @@ def aggregate_scalers(scalers: list[StandardScaler]) -> StandardScaler:
     pooled = StandardScaler()
     pooled.mean_ = pooled_mean
     pooled.var_ = pooled_var
-    # Guard against a constant feature producing a zero divisor.
+    # a constant feature would give a zero scale
     pooled.scale_ = np.sqrt(np.where(pooled_var > 0, pooled_var, 1.0))
     pooled.n_features_in_ = scalers[0].n_features_in_
     pooled.n_samples_seen_ = int(total)
     return pooled
 
+
 def transform_internal(
     training_scaler: StandardScaler, x: pd.DataFrame | np.ndarray
 ) -> np.ndarray:
-    """Standardise validation or test folds drawn from the training distribution.
-
-    Cross-validation folds always use the training scaler: the site is the same,
-    so there is nothing to adapt to and the contract question does not arise.
-    """
+    """Standardize validation or test folds with the training scaler."""
     return training_scaler.transform(np.asarray(x, dtype="float64"))

@@ -1,32 +1,28 @@
-"""Where results go, and how they come back out.
+"""Writing the results of a run and reading them back.
 
-Comparing approaches and pulling numbers into the paper should each be one
-line, and neither should require knowing how a particular arm was implemented. Every run writes the same shape, whichever arm, strategy and
-scaling contract produced it:
+Every run, whatever the arm, writes the same files:
 
     results/
-      index.csv                       one row per run: what it was, when, how long
+      index.csv                 one row per run
       <run_id>/
-        config.json                   the full ExperimentConfig, for provenance
-        metrics.csv                   LONG format, one row per measurement
-        profile.json                  wall-clock, compute, communication
-        predictions/rep{r}_fold{f}.npz  y_true, y_pred, subject metadata
+        config.json             the ExperimentConfig
+        metrics.csv             long format, one row per measurement
+        profile.json            wall-clock, compute, communication
+        code_version.json       commit of the code
+        aggregation_weights.csv, round_log.csv   (federated runs)
+        predictions/<evaluation>_rep{r}_fold{f}.npz   y_true, y_pred, site, subject
 
-`metrics.csv` is long rather than wide on purpose. Every measurement is one row
-tagged with arm, strategy, scaling contract, evaluation set, site, stratum,
-repetition and fold, so a new axis (another strategy, another noise level,
-another stratification) adds rows and breaks nothing downstream. Wide tables
-for the manuscript are produced by pivoting at the end, in `paper_table`.
-
-Predictions are kept per fold because the pairwise tests need subject-level
-scores from two approaches on the same subjects.
-Aggregated metrics cannot support DeLong.
+`metrics.csv` has one row per (evaluation, site, stratum, repetition, fold, metric).
+The predictions of every fold are kept because the paired tests need the scores of
+two approaches on the same subjects.
 """
 
 from __future__ import annotations
 
+import fcntl
 import json
 import re
+import subprocess
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -34,59 +30,83 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from .config import RESULTS_DIR, ExperimentConfig
+from .config import RESULTS_DIR, WORKSPACE, ExperimentConfig
 from .evaluation import Metrics
 
-#: Column order for the long metrics table.
+# columns of metrics.csv
 LONG_COLUMNS = [
     "run_id", "arm", "strategy", "scaling", "evaluation", "site",
     "stratum_kind", "stratum", "repetition", "fold", "metric", "value",
 ]
 
-def make_run_id(cfg: ExperimentConfig) -> str:
-    """Deterministic, readable, and stable across re-runs.
 
-    Re-running the same configuration overwrites its folder rather than
-    accumulating timestamped duplicates, which leave several near-identical
-    folders and no way to tell which produced the reported numbers.
+def code_version() -> dict:
+    """Commit of the code, and whether metscore/ or scripts/ had uncommitted changes.
+
+    Both are None when the code is not the root of a git repository of its own (a plain
+    copy inside another one, for instance): the commit found would not be this code's.
     """
-    # The scaling contract is deliberately not part of the id: every run records
-    # both contracts, so it identifies an evaluation, not a run.
+
+    def git(*args):
+        done = subprocess.run(
+            ["git", "-C", str(WORKSPACE), *args], capture_output=True, text=True
+        )
+        return done.stdout.strip() if done.returncode == 0 else None
+
+    top = git("rev-parse", "--show-toplevel")
+    if top is None or Path(top).resolve() != WORKSPACE.resolve():
+        return {"git_commit": None, "git_dirty": None}
+
+    return {
+        "git_commit": git("rev-parse", "HEAD"),
+        "git_dirty": bool(git("status", "--porcelain", "--", "metscore", "scripts")),
+    }
+
+
+def make_run_id(cfg: ExperimentConfig) -> str:
+    """Folder name of a run: arm, strategy, parameters and variant.
+
+    The same configuration always gets the same name, so a re-run overwrites it.
+    The scaling contract is not part of the name because every run saves both.
+    """
     parts = [cfg.arm, cfg.strategy]
     if cfg.strategy_params:
         parts.append(
             "_".join(f"{k}{v}" for k, v in sorted(cfg.strategy_params.items()))
         )
+    if cfg.variant:
+        parts.append(cfg.variant)
     return "__".join(str(p) for p in parts)
+
 
 @dataclass
 class RunWriter:
-    """Accumulates one run's output, then flushes it atomically."""
+    """Collects the output of a run and writes it when the run ends."""
 
     config: ExperimentConfig
     run_id: str = ""
     _rows: list[dict] = None
     _started: datetime = None
+    _weights: list[dict] = None
+    _rounds: list[dict] = None
 
     def __post_init__(self):
         self.run_id = self.run_id or make_run_id(self.config)
         self._rows = []
+        self._weights = []
+        self._rounds = []
         self._started = datetime.now()
         self.path.mkdir(parents=True, exist_ok=True)
 
-        # Start clean. A re-run that produces fewer folds than its predecessor
-        # would otherwise leave stale .npz files behind, and `load_predictions`
-        # globs the directory, so a later analysis would silently mix results
-        # from two different versions of the code. metrics.csv is overwritten
-        # wholesale at close, but predictions are written file by file.
+        # Remove the predictions of a previous run with the same name, or
+        # load_predictions would mix old and new folds.
         predictions = self.path / "predictions"
         if predictions.exists():
             for stale in predictions.glob("*.npz"):
                 stale.unlink()
         predictions.mkdir(exist_ok=True)
 
-        # An interrupted run must not look finished: remove the completion
-        # marker up front and let close() write it again.
+        # metrics.csv marks a finished run and is written by close()
         metrics = self.path / "metrics.csv"
         if metrics.exists():
             metrics.unlink()
@@ -94,8 +114,6 @@ class RunWriter:
     @property
     def path(self) -> Path:
         return RESULTS_DIR / self.run_id
-
-    # -- recording ---------------------------------------------------------
 
     def record(
         self,
@@ -107,7 +125,7 @@ class RunWriter:
         stratum_kind: str = "none",
         stratum: str = "ALL",
     ) -> None:
-        """Add one evaluation's metrics as long-format rows."""
+        """Add the metrics of one evaluation."""
         base = {
             "run_id": self.run_id,
             "arm": self.config.arm,
@@ -134,11 +152,10 @@ class RunWriter:
         site: np.ndarray | None = None,
         subject_index: np.ndarray | None = None,
     ) -> None:
-        """Persist subject-level scores so pairwise tests remain possible later.
+        """Save the scores of one fold.
 
-        ``subject_index`` is the row index into the discovery/external table. It
-        is what lets two runs be aligned to the same subjects for DeLong without
-        assuming both iterated in the same order.
+        `subject_index` is the row of each subject in the discovery or external
+        table, used later to align two runs on the same subjects.
         """
         np.savez_compressed(
             self.path / "predictions" / f"{evaluation}_rep{repetition}_fold{fold}.npz",
@@ -150,7 +167,15 @@ class RunWriter:
             ),
         )
 
-    # -- flushing ----------------------------------------------------------
+    def record_aggregation_weights(self, repetition: int, fold: int, rows: list[dict]) -> None:
+        """Weight applied to each client in this fold."""
+        self._weights.extend({"repetition": repetition, "fold": fold, **row} for row in rows)
+
+    def record_round(self, repetition: int, fold: int, round_index: int, score: float) -> None:
+        """Federated validation score of one round."""
+        self._rounds.append(
+            {"repetition": repetition, "fold": fold, "round": round_index, "validation_auroc": score}
+        )
 
     def close(self, profile: dict | None = None, notes: str = "") -> Path:
         if not self._rows:
@@ -159,6 +184,11 @@ class RunWriter:
         frame = pd.DataFrame(self._rows)[LONG_COLUMNS]
         frame.to_csv(self.path / "metrics.csv", index=False)
         self.config.save(self.path / "config.json")
+        if self._weights:
+            pd.DataFrame(self._weights).to_csv(self.path / "aggregation_weights.csv", index=False)
+        if self._rounds:
+            pd.DataFrame(self._rounds).to_csv(self.path / "round_log.csv", index=False)
+        (self.path / "code_version.json").write_text(json.dumps(code_version(), indent=2))
 
         elapsed = (datetime.now() - self._started).total_seconds()
         if profile is not None:
@@ -179,29 +209,28 @@ class RunWriter:
         )
         return self.path
 
+
 def _update_index(row: dict) -> None:
-    """Keep one row per run_id, most recent wins."""
+    """One row per run in index.csv, the latest one."""
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     index_path = RESULTS_DIR / "index.csv"
 
-    frame = pd.DataFrame([row])
-    if index_path.exists():
-        existing = pd.read_csv(index_path)
-        existing = existing[existing["run_id"] != row["run_id"]]
-        frame = pd.concat([existing, frame], ignore_index=True)
+    # Several jobs of a grid can finish at the same moment, so the file is locked
+    # while it is read and rewritten.
+    with open(RESULTS_DIR / ".index.lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        frame = pd.DataFrame([row])
+        if index_path.exists() and index_path.stat().st_size:
+            existing = pd.read_csv(index_path)
+            existing = existing[existing["run_id"] != row["run_id"]]
+            frame = pd.concat([existing, frame], ignore_index=True)
+        frame.sort_values(["arm", "strategy", "scaling"]).to_csv(index_path, index=False)
 
-    frame.sort_values(["arm", "strategy", "scaling"]).to_csv(index_path, index=False)
+# Reading results
 
-# ---------------------------------------------------------------------------
-# Reading back
-# ---------------------------------------------------------------------------
 
 def collect(pattern: str = "*") -> pd.DataFrame:
-    """Every measurement from every run, in one long table.
-
-    This is the entry point for the analysis scripts: they read this and
-    nothing else, and never reload a model or recompute a metric.
-    """
+    """The metrics of every run matching `pattern`, as one long table."""
     frames = [
         pd.read_csv(path)
         for path in sorted(RESULTS_DIR.glob(f"{pattern}/metrics.csv"))
@@ -210,16 +239,12 @@ def collect(pattern: str = "*") -> pd.DataFrame:
         raise FileNotFoundError(f"no runs matching {pattern!r} under {RESULTS_DIR}")
     return pd.concat(frames, ignore_index=True)
 
-def load_predictions(run_id: str, evaluation: str = "external") -> pd.DataFrame:
-    """Subject-level scores for one run, concatenated across folds.
 
-    Feed two of these to `stats.delong_test` after aligning on
-    ``subject_index`` to compare approaches on identical subjects.
-    """
+def load_predictions(run_id: str, evaluation: str = "external") -> pd.DataFrame:
+    """Scores of one run on one evaluation set, all folds."""
     rows = []
     for path in sorted((RESULTS_DIR / run_id / "predictions").glob(f"{evaluation}_rep*.npz")):
-        # Split from the right: evaluation names contain underscores of their
-        # own ("external_train_fitted"), so splitting from the left mis-parses.
+        # from the right, the evaluation name has underscores too
         _, rep, fold = path.stem.rsplit("_", 2)
         payload = np.load(path, allow_pickle=True)
         n = len(payload["y_true"])
@@ -241,12 +266,13 @@ def load_predictions(run_id: str, evaluation: str = "external") -> pd.DataFrame:
         raise FileNotFoundError(f"no {evaluation} predictions for run {run_id!r}")
     return pd.concat(rows, ignore_index=True)
 
+
 def summarise(
     long: pd.DataFrame,
     metrics: tuple[str, ...] = ("auroc", "pr_auc", "sensitivity", "specificity", "ppv"),
     by: tuple[str, ...] = ("arm", "strategy", "scaling", "evaluation"),
 ) -> pd.DataFrame:
-    """Mean and SD across folds, ready to read."""
+    """Mean and SD across folds."""
     subset = long[
         (long["metric"].isin(metrics))
         & (long["stratum_kind"] == "none")
@@ -260,12 +286,13 @@ def summarise(
     out["display"] = out.apply(lambda r: f"{r['mean']:.3f} ± {r['sd']:.3f}", axis=1)
     return out
 
+
 def paper_table(
     long: pd.DataFrame,
     evaluation: str = "cv",
     metrics: tuple[str, ...] = ("auroc", "pr_auc", "sensitivity", "specificity", "ppv"),
 ) -> pd.DataFrame:
-    """Pivot into the wide shape used in the manuscript's results tables."""
+    """Wide table of mean ± SD, one row per run."""
     summary = summarise(long, metrics=metrics)
     summary = summary[summary["evaluation"] == evaluation]
     wide = summary.pivot_table(
@@ -276,49 +303,40 @@ def paper_table(
     )
     return wide.reindex(columns=[m for m in metrics if m in wide.columns]).reset_index()
 
-#: pdfLaTeX with inputenc cannot typeset these code points, and pandas passes
-#: them through untouched because they are not LaTeX special characters. The
-#: substitution therefore runs after `to_latex`, leaving escape=True to protect
-#: everything else.
+
+# Characters pdfLaTeX cannot print and pandas does not escape; replaced after
+# DataFrame.to_latex.
 UNICODE_TO_LATEX = {
     "μ": r"$\mu$", "σ": r"$\sigma$", "ε": r"$\varepsilon$",
     "Δ": r"$\Delta$", "±": r"$\pm$",
     "−": "$-$", "–": "--", "—": "---",
 }
 
-#: Column headers as they should read in print.
+# column headers in the tables
 HEADERS = {
     "auroc": "AUROC", "pr_auc": "PR-AUC", "sensitivity": "Sens.",
     "specificity": "Spec.", "ppv": "PPV", "npv": "NPV",
     "brier": "Brier", "ece": "ECE", "metric": "",
 }
 
+
 def latex_safe(text: str) -> str:
     for char, replacement in UNICODE_TO_LATEX.items():
         text = text.replace(char, replacement)
     return text
 
-def _check_latex(tex: str, label: str) -> None:
-    """Two escaping slips that a compiler log reports only as damage downstream.
 
-    Both have shipped once already, so they are caught where they are made.
-    """
-    # In LaTeX a double backslash is a row separator; before a letter it is
-    # always an escaping slip from generated text, and it silently destroys the
-    # surrounding table.
+def _check_latex(tex: str, label: str) -> None:
+    """Catch escaping mistakes in a generated table before it is written."""
+    # a double backslash before a letter is an over-escaped command
     slips = re.findall(r"\\\\[A-Za-z]+", tex)
     if slips:
         raise ValueError(
             f"{label}: double backslash before a command, {sorted(set(slips))}. "
             "Check the caption for over-escaped LaTeX."
         )
-    # The mirror image: a caption written as a plain (non-raw) Python string
-    # turns \v, \t, \b, \a, \f into control characters, so \varepsilon reaches
-    # the file as VT + "arepsilon". Invisible in an editor, fatal to pdfLaTeX.
-    # pandas escapes with escape=True, so a header written as "$\\Delta$" arrives
-    # as "\\$\\textbackslash Delta\\$" and typesets as literal characters. Greek and
-    # symbols belong in the column name as Unicode, which UNICODE_TO_LATEX
-    # converts after escaping.
+    # maths in a column name gets escaped by pandas; use the Unicode symbol,
+    # which UNICODE_TO_LATEX converts afterwards
     escaped_math = re.findall(r"\\\\\$|\\\\textbackslash", tex)
     if escaped_math:
         raise ValueError(
@@ -333,6 +351,7 @@ def _check_latex(tex: str, label: str) -> None:
             "\\a or \\f; prefix it with r."
         )
 
+
 def to_latex(
     table: pd.DataFrame,
     caption: str,
@@ -344,9 +363,7 @@ def to_latex(
     tabcolsep: str = None,
     note: str = None,
 ) -> str:
-    """    One definition for every analysis script: a second copy drifted once and
-        emitted raw Greek letters that pdfLaTeX refused to compile.
-    """
+    """Write a DataFrame as a booktabs table. Returns the LaTeX source."""
     table = table.rename(columns=HEADERS)
     table.columns.name = None
     body = table.to_latex(
@@ -356,15 +373,12 @@ def to_latex(
         float_format=lambda v: f"{v:.{digits}f}",
     )
     env = "table*" if full_width else "table"
-    # A single IEEE column is about 252pt; six columns of prose headers overrun
-    # it and spill into the neighbouring column. Tightening the gutter buys
-    # roughly 36pt without touching the font size.
+    # a narrower column gap for tables that have to fit one IEEE column
     gutter = f"\\setlength{{\\tabcolsep}}{{{tabcolsep}}}\n" if tabcolsep else ""
 
     if note:
-        # Outside the tabular, not as a \multicolumn row inside it. A spanning
-        # cell wider than the columns it covers forces the table to that width
-        # and dumps the surplus into the last column, which visibly detaches it.
+        # the note goes under the tabular; inside it, as a \multicolumn row,
+        # it would stretch the last column
         width = r"\textwidth" if full_width else r"\columnwidth"
         body += r"\par\vspace{2pt}\parbox{%s}{\footnotesize %s}" % (width, note) + "\n"
     tex = (
@@ -379,6 +393,7 @@ def to_latex(
         print(f"wrote {path}")
     return tex
 
+
 def to_latex_grouped(
     sections,
     caption: str,
@@ -387,14 +402,10 @@ def to_latex_grouped(
     note: str = None,
     full_width: bool = True,
 ) -> str:
-    """Emit one booktabs table whose rows are grouped under headings.
+    """Write one table with its rows grouped under headings.
 
-    `sections` is [(heading, [(subheading_or_None, DataFrame), ...]), ...]. The
-    frames must already hold formatted strings and share their columns, which is
-    the condition that makes the grouping meaningful: cross-validation and
-    external validation are the same models and the same metrics, so putting
-    them in one table turns a comparison between two floats into a vertical
-    read.
+    `sections` is [(heading, [(subheading or None, DataFrame), ...]), ...]. The
+    frames hold formatted strings and have the same columns.
     """
     columns = list(sections[0][1][0][1].columns)
     ncol = len(columns) + 1
@@ -426,9 +437,6 @@ def to_latex_grouped(
         f"\\begin{{tabular}}{{l{'c' * len(columns)}}}\n"
         + "\n".join(lines)
         + "\n\\end{tabular}\n"
-        # Outside the tabular: a spanning cell wider than the columns it covers
-        # forces the table to that width and pushes the surplus into the last
-        # column, detaching it visibly from the rest.
         + (r"\par\vspace{2pt}\parbox{%s}{\footnotesize %s}" % (
               r"\textwidth" if full_width else r"\columnwidth", note) + "\n"
            if note else "")

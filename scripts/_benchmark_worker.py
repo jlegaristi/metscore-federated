@@ -1,12 +1,11 @@
-"""One timing measurement, in a process of its own.
+"""Time one device/thread configuration; called by benchmark.py.
 
-TensorFlow reads the threading and device environment variables once, when it is
-imported, so a single process cannot measure more than one configuration. This
-worker is therefore launched once per configuration by `benchmark.py`.
+TensorFlow reads the thread and device settings when it is imported, so each
+configuration needs its own process.
 
 Usage:  python scripts/_benchmark_worker.py {cpu|gpu} <threads>
 
-Prints the mean milliseconds per epoch.
+Prints the mean time per epoch in milliseconds.
 """
 
 from __future__ import annotations
@@ -57,7 +56,7 @@ def main() -> None:
         x, y, ImbalanceConfig(), seed=cv.seed
     )
 
-    # One untimed epoch first, so that graph tracing is not counted.
+    # one epoch first, so that graph tracing is not timed
     model.build(len(BIOMARKERS)).fit(x, y, epochs=1, batch_size=16, verbose=0)
 
     start = time.perf_counter()

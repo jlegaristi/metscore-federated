@@ -1,20 +1,15 @@
-"""
-Process setup and scheduling. Import before TensorFlow, always.
+"""Process setup (threads, GPU, seeds). Must be imported before TensorFlow.
 
-Measured on the machine used for these experiments (see `scripts/benchmark.py`):
+The network is small (24,289 trainable parameters, batches of 16) and trains faster
+on one CPU thread than on a GPU. Measured with `scripts/benchmark.py` on the server
+used for the experiments:
 
   CPU, 1 thread        314 ms/epoch
   CPU, unconstrained   716 ms/epoch
   GPU (RTX A6000)     1060 ms/epoch
 
-  concurrent throughput      N=4    N=8   N=16
-  CPU (jobs/min)            14.1   27.1   38.6
-  GPU (jobs/min)             7.5   14.0   19.9
-
-The network has 24,289 trainable parameters and trains on batches of 16, which
-is too little work to amortize a GPU's per-batch kernel launches. Throughput
-comes from running many single-threaded jobs rather than from accelerating one,
-so each job pins itself to one thread and hides the GPU.
+So every job runs on one thread with the GPU hidden, and the grid runs many jobs in
+parallel.
 """
 
 from __future__ import annotations
@@ -22,15 +17,12 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-#: Leave headroom on a shared host rather than claiming the whole quota.
+# share of the CPU quota used by default; the server is shared
 DEFAULT_UTILISATION = 0.75
 
-def configure_worker(threads: int = 1, use_gpu: bool = False) -> None:
-    """Pin this process. Must run before TensorFlow is imported.
 
-    Every runner calls this first. Arms never configure threading themselves --
-    a job that quietly grabs 16 threads starves the other fifteen jobs.
-    """
+def configure_worker(threads: int = 1, use_gpu: bool = False) -> None:
+    """Limit the threads of this process. Call it before importing TensorFlow."""
     if not use_gpu:
         os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
@@ -43,15 +35,16 @@ def configure_worker(threads: int = 1, use_gpu: bool = False) -> None:
         TF_NUM_INTEROP_THREADS="1",
     )
 
+
 def apply_tensorflow_threading(threads: int = 1) -> None:
-    """Belt and braces: TF ignores the env vars if it was imported first."""
+    """Same limits through the TensorFlow API, in case it was already imported."""
     import tensorflow as tf
 
     try:
         tf.config.threading.set_intra_op_parallelism_threads(threads)
         tf.config.threading.set_inter_op_parallelism_threads(1)
     except RuntimeError:
-        # Already initialised; the environment variables did the work.
+        # already initialised, the environment variables apply
         pass
 
     for gpu in tf.config.list_physical_devices("GPU"):
@@ -60,12 +53,9 @@ def apply_tensorflow_threading(threads: int = 1) -> None:
         except RuntimeError:
             pass
 
-def cpu_quota() -> float:
-    """CPU cores this container may actually use.
 
-    ``nproc`` reports the host's 200 cores; the cgroup quota is 16. Scheduling
-    against the former would oversubscribe by 12x and slow everything down.
-    """
+def cpu_quota() -> float:
+    """Cores available to this container (the cgroup quota, not the host's cores)."""
     for path, parse in (
         ("/sys/fs/cgroup/cpu.max", _parse_cgroup_v2),
         ("/sys/fs/cgroup/cpu/cpu.cfs_quota_us", _parse_cgroup_v1),
@@ -79,9 +69,11 @@ def cpu_quota() -> float:
 
     return float(len(os.sched_getaffinity(0)))
 
+
 def _parse_cgroup_v2(path: Path) -> float | None:
     quota, period = path.read_text().split()
     return None if quota == "max" else float(quota) / float(period)
+
 
 def _parse_cgroup_v1(path: Path) -> float | None:
     quota = float(path.read_text().strip())
@@ -90,15 +82,11 @@ def _parse_cgroup_v1(path: Path) -> float | None:
     period = float(Path("/sys/fs/cgroup/cpu/cpu.cfs_period_us").read_text().strip())
     return quota / period
 
-def recommended_workers(utilisation: float = DEFAULT_UTILISATION) -> int:
-    """How many single-threaded jobs to run at once.
 
-    Efficiency measured 0.96x at eight concurrent workers and 0.69x at sixteen,
-    so filling the quota exactly buys throughput at the cost of being a bad
-    neighbour on a shared machine. The default backs off; override it with
-    `--workers` when the host is quiet.
-    """
+def recommended_workers(utilisation: float = DEFAULT_UTILISATION) -> int:
+    """Number of single-threaded jobs to run at once (override with --workers)."""
     return max(1, int(cpu_quota() * utilisation))
+
 
 def describe() -> dict:
     quota = cpu_quota()
@@ -112,14 +100,12 @@ def describe() -> dict:
         ),
     }
 
-def seed_everything(seed: int) -> None:
-    """Make a fold reproducible.
 
-    The CV seed governs fold assignment and downsampling, but weight
-    initialisation, dropout and mini-batch shuffling draw from the global
-    Python/NumPy/TensorFlow generators. Without seeding those, the same
-    configuration trains a different network on every run: re-running the grid
-    moved pooled AUROCs by up to 0.005 and per-cohort figures by 0.07.
+def seed_everything(seed: int) -> None:
+    """Seed Python, NumPy and TensorFlow.
+
+    Weight initialization, dropout and batch shuffling use the global generators,
+    so without this a run would not reproduce.
     """
     import tensorflow as tf
 

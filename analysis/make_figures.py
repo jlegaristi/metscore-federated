@@ -1,7 +1,6 @@
-# Figures, as vector PDF for LaTeX with a PNG alongside for quick viewing.
-# Style lives in metscore.plotting, so every figure shares one palette and one
-# set of defaults. Each series carries a marker and a line style as well as a
-# colour, so the figures survive greyscale printing.
+# Figures, saved as PDF and PNG. The style is in metscore/plotting.py.
+#
+# Run scripts/run_experiments.py first, then this script from analysis/.
 
 import sys
 from pathlib import Path
@@ -13,6 +12,7 @@ import numpy as np
 import pandas as pd
 
 from metscore import plotting, results, stats
+from metscore.config import OUTPUT_DIR, RESULTS_DIR
 from metscore.plotting import (
     AQUA, BLUE, CRITICAL, GRID, INK, INK_SOFT, MUTED, ORANGE, VIOLET,
     DOUBLE_COLUMN, SINGLE_COLUMN, label_for,
@@ -20,9 +20,10 @@ from metscore.plotting import (
 
 plotting.apply_style()
 
-FIGURES = Path.cwd().parent / "figures"
+FIGURES = OUTPUT_DIR / "figures"
 long = results.collect()
 print(f"{long.run_id.nunique()} runs loaded; figures -> {FIGURES}")
+
 
 def aligned(run_id, evaluation="external_train_fitted"):
     frame = results.load_predictions(run_id, evaluation)
@@ -32,14 +33,16 @@ def aligned(run_id, evaluation="external_train_fitted"):
         .reset_index()
     )
 
+
 def declutter(values, min_gap):
-    """Nudge labels apart while keeping their order, so none overlap."""
+    """Move labels apart so that they do not overlap, keeping their order."""
     order = np.argsort(values)
     placed = np.array(values, dtype=float)
     for a, b in zip(order[:-1], order[1:]):
         if placed[b] - placed[a] < min_gap:
             placed[b] = placed[a] + min_gap
     return placed
+
 
 def fold_means(metric="auroc", evaluation="cv"):
     sel = long[
@@ -48,8 +51,8 @@ def fold_means(metric="auroc", evaluation="cv"):
     ]
     return sel.groupby("run_id")["value"]
 
-# Pairwise comparison against the federated model, with Holm-corrected
-# significance. One series, so no legend is needed.
+# Forest plot: every approach against FedAvg (ensemble predictions, DeLong, Holm).
+
 
 REFERENCE = "federated__fedavg"
 COMPARATORS = [
@@ -87,7 +90,7 @@ ax.set_xlabel("Δ AUROC versus federated model  (95% CI)")
 ax.set_ylim(-0.6, len(forest) - 0.4)
 ax.grid(axis="y", visible=False)
 
-# Direct labels: significance is stated in words, never by colour alone.
+# AUROC next to each interval, with an asterisk when significant
 for i, row in forest.iterrows():
     ax.annotate(
         f"{row.auc:.3f}" + ("  *" if row.significant else ""),
@@ -95,7 +98,7 @@ for i, row in forest.iterrows():
         va="center", fontsize=7, color=INK_SOFT,
     )
 
-# The difference is comparator minus federated, so negative favours federation.
+# differences are comparator minus federated
 ax.annotate("← federated better", xy=(0, -0.45), xytext=(-6, 0),
             textcoords="offset points", fontsize=6.5, color=MUTED, ha="right")
 ax.annotate("comparator better →", xy=(0, -0.45), xytext=(6, 0),
@@ -105,21 +108,21 @@ ax.set_title("* Holm-corrected p < 0.05", fontsize=7, color=MUTED, loc="right", 
 plotting.save(fig, "fig_pairwise_comparison")
 plt.show()
 
-# Privacy and utility: epsilon against the noise the model survives, on a
-# log-scaled axis. The shaded band marks the range in which a guarantee is
-# conventionally considered meaningful.
+# Privacy-utility curve: cross-validation AUROC against epsilon (log scale). The
+# band marks epsilon below 10.
 
 import json
 
 dp_rows = []
-for path in sorted(
-    (Path.cwd().parent / "results").glob("federated__dp_fedavg*/profile.json"),
-    key=lambda p: float(p.parent.name.rsplit("noise_multiplier", 1)[1]),
-):
+reference_auroc = None
+for path in RESULTS_DIR.glob("federated__dp_fedavg*/profile.json"):
     dp = json.loads(path.read_text()).get("differential_privacy")
     if not dp:
         continue
     run = path.parent.name
+    if run.endswith("__reference"):
+        reference_auroc = fold_means().mean().get(run, np.nan)
+        continue
     dp_rows.append({
         "noise": dp["noise_multiplier"],
         "epsilon": dp["epsilon"],
@@ -127,7 +130,7 @@ for path in sorted(
     })
 
 dp = pd.DataFrame(dp_rows).sort_values("epsilon")
-baseline = fold_means().mean()["federated__fedavg"]
+baseline = reference_auroc
 
 fig, ax = plt.subplots(figsize=(SINGLE_COLUMN, 2.4))
 
@@ -156,15 +159,11 @@ ax.annotate("meaningful\nguarantee", xy=(4, 0.93), fontsize=6.5, color=AQUA,
 plotting.save(fig, "fig_privacy_utility")
 plt.show()
 
-# External performance by sub-cohort. The three validation sites differ in
-# prevalence: 9.6%, 2.9% and 77.6%.
+# External AUROC at each validation site.
 
 SHOWN = ["unified__centralised", "federated__fedavg",
          "individual__AKRIBEA", "individual__METS+"]
 COLOURS = [BLUE, ORANGE, AQUA, VIOLET]
-# No hatching: four hues already separate the series. The labels name the
-# model, since "AKRIBEA" alone is ambiguous in a chart whose x axis is also
-# cohorts.
 NAMES = ["Centralized", "Federated (FedAvg)", "AKRIBEA only", "METS+ only"]
 
 per_site = (
@@ -190,8 +189,7 @@ for i, (run, colour, name) in enumerate(zip(SHOWN, COLOURS, NAMES)):
 ax.set_xticks(x)
 ax.set_xticklabels(["BPH", "GRAZ", "TÜBINGEN"])
 
-# Cohort size and prevalence sit above each group: as tick sublabels they are
-# wider than the group spacing and collide.
+# size and prevalence of each site, above its bars
 for pos, n, prev in zip(x, [324, 279, 58], ["9.6%", "2.9%", "77.6%"]):
     ax.annotate(f"n={n}\n{prev} MetS+", xy=(pos, 0.995), ha="center", va="top",
                 fontsize=6.5, color=MUTED, linespacing=1.3)
@@ -204,8 +202,7 @@ ax.legend(ncol=2, loc="upper center", bbox_to_anchor=(0.5, 1.28), columnspacing=
 plotting.save(fig, "fig_per_site")
 plt.show()
 
-# The scaling contract, as a slope chart, so that the pairing between the two
-# contracts is what the reader sees.
+# Train-fitted against site-adapted scaling, as a slope chart.
 
 contract = (
     long[
@@ -240,13 +237,11 @@ ax.grid(axis="x", visible=False)
 plotting.save(fig, "fig_scaling_contract")
 plt.show()
 
-# Calibration. Averaging models trained on cohorts whose prevalence ranges from
-# 0.83% to 63.95% produces probabilities that are not on a common scale.
-# Quantile bins, because predictions pile up near zero at 2% prevalence.
+# Reliability curves on the external cohort, quantile bins.
 
 from metscore.evaluation import calibration_curve
 
-CALIB = ["unified__centralised", "federated__fedavg", "federated__fedprox__mu0.1"]
+CALIB = ["unified__centralised", "federated__fedavg", "federated__fedavg_cohort"]
 
 fig, ax = plt.subplots(figsize=(SINGLE_COLUMN, 2.6))
 ax.plot([0, 1], [0, 1], linestyle=":", color=MUTED, linewidth=1, zorder=1)
@@ -265,7 +260,7 @@ ax.set_xlabel("Predicted probability")
 ax.set_ylabel("Observed frequency")
 ax.set_xlim(0, 1.45)
 ax.set_ylim(0, 1.05)
-# Space to the right is for the direct labels, not for impossible probabilities.
+# the axis extends past 1 to leave room for the labels
 ax.set_xticks([0, 0.2, 0.4, 0.6, 0.8, 1.0])
 ax.annotate("perfect calibration", xy=(0.62, 0.62), rotation=45, fontsize=6.5,
             color=MUTED, ha="center", va="bottom")
@@ -273,9 +268,7 @@ ax.annotate("perfect calibration", xy=(0.62, 0.62), rotation=45, fontsize=6.5,
 plotting.save(fig, "fig_calibration")
 plt.show()
 
-# Performance by age band.
-#
-# bands, and the elderly are the population the model would most often serve.
+# Cross-validation AUROC by age band.
 
 BANDS = ["25-34", "35-44", "45-54", "55-64", "65-69", "70-79", "80+"]
 age = (
@@ -312,9 +305,8 @@ print("Figures written:")
 for path in sorted(FIGURES.glob("*.pdf")):
     print(f"  \\includegraphics[width=\\columnwidth]{{figures/{path.name}}}")
 
-# What each aggregation rule costs and what it buys. A two-panel dot plot
-# rather than a scatter, because eight labelled points would need eight
-# hand-placed annotations and the ordering reads better as a column.
+# Calibration error and training time of each strategy, as two dot plots sharing
+# the y axis.
 
 import json
 
@@ -326,6 +318,7 @@ FAMILY = {
     "federated__fedprox__mu1.0": VIOLET,
 }
 
+
 def _ext(run, metric):
     sel = long[
         (long.run_id == run) & (long.metric == metric)
@@ -334,11 +327,10 @@ def _ext(run, metric):
     ]
     return sel.value.mean()
 
+
 cost = pd.DataFrame([
     {
         "run": run,
-        # Shortened for the gutter: the full names do not fit between the
-        # panels at single-column width, and the caption carries the detail.
         "name": label_for(run),
         "colour": colour,
         "hours": json.loads(
@@ -356,9 +348,7 @@ fig, axes = plt.subplots(
 )
 y = np.arange(len(cost))
 
-# Both metrics radiate from the shared inner edge, so each model reads as one
-# line. The names sit outside the pair, on the far left, which keeps the centre
-# free and lets the whole thing fit a single column.
+# calibration grows to the left and time to the right, from a common axis
 for ax, column, label, limit, fmt, side, ticks in (
     (axes[0], "ece", "Calibration error", (0.10, 0.46), "{:.3f}", -1, [0.2, 0.3, 0.4]),
     (axes[1], "hours", "Training time (h)", (0.0, 3.4), "{:.2f}", +1, [1, 2, 3]),
@@ -373,23 +363,20 @@ for ax, column, label, limit, fmt, side, ticks in (
                     va="center", ha="left" if side > 0 else "right",
                     fontsize=5.4, color=INK_SOFT)
     ax.set_xlim(*limit)
-    # No tick at the shared edge: the two zeros would print on top of each other.
+    # no tick at the common edge
     ax.set_xticks(ticks)
     ax.set_xlabel(label)
     ax.grid(axis="y", visible=False)
 
 axes[0].invert_xaxis()
 
-# The panels are flush, so each model's two stems meet and read as one line.
-# The join is marked by the shared spine, which is the only vertical rule in
-# the figure and so needs no legend: left of it is calibration, right is time.
+# the two panels touch; the spine between them is the common axis
 axes[0].spines["right"].set_visible(True)
 axes[0].spines["right"].set_color(INK_SOFT)
 axes[0].spines["right"].set_linewidth(1.1)
 axes[1].spines["left"].set_visible(False)
 for k, row in cost.iterrows():
-    # A small tick on the centre line, in the model's colour, so the row is
-    # traceable across the join.
+    # tick on the common axis, in the colour of the model
     axes[0].plot(0.10, k, "|", color=row.colour, markersize=7,
                  markeredgewidth=1.4, clip_on=False, zorder=4)
 axes[0].set_yticks(y)

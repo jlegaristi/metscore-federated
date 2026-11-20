@@ -7,7 +7,7 @@
 #
 # Then, from anywhere:
 #   tail -f <the log it prints>                        watch progress
-#   .venv/bin/python scripts/run_experiments.py --status   what has finished
+#   python scripts/run_experiments.py --status         what has finished
 #   kill <the pid it prints>                           stop cleanly
 #
 # Stopping is safe. Finished runs are kept and skipped on the next launch, so
@@ -16,19 +16,19 @@
 set -euo pipefail
 
 WORKSPACE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-VENV="$(cd "${WORKSPACE}/../../../../../.." && pwd)/.venv/bin/python"
+PYTHON="${PYTHON:-${WORKSPACE}/.venv/bin/python}"
+DATA="${METSCORE_DATA_DIR:-${WORKSPACE}/data}"
 
-if [[ ! -x "${VENV}" ]]; then
-    echo "Interpreter not found at ${VENV}" >&2
-    echo "Edit VENV in this script, or run scripts/run_experiments.py directly." >&2
+if [[ ! -x "${PYTHON}" ]]; then
+    echo "Interpreter not found at ${PYTHON}; set PYTHON to the one to use." >&2
     exit 1
 fi
 
 cd "${WORKSPACE}"
 
-if [[ ! -f data/discovery.parquet || ! -f data/external.parquet ]]; then
+if [[ ! -f "${DATA}/discovery.csv" || ! -f "${DATA}/external.csv" ]]; then
     echo "Building the data snapshot first..."
-    "${VENV}" scripts/prepare_data.py
+    "${PYTHON}" scripts/prepare_data.py
     echo
 fi
 
@@ -37,7 +37,7 @@ LOG="results/grid_$(date +%Y%m%d_%H%M%S).log"
 
 # setsid detaches from the terminal session, so a dropped SSH connection does
 # not take the grid down with it.
-setsid nohup "${VENV}" scripts/run_experiments.py "$@" > "${LOG}" 2>&1 &
+setsid nohup "${PYTHON}" scripts/run_experiments.py "$@" > "${LOG}" 2>&1 &
 PID=$!
 
 sleep 2
@@ -45,7 +45,7 @@ echo "Grid running.  pid ${PID}"
 echo "log            ${WORKSPACE}/${LOG}"
 echo
 echo "  tail -f ${LOG}"
-echo "  ${VENV} scripts/run_experiments.py --status"
+echo "  ${PYTHON} scripts/run_experiments.py --status"
 echo "  kill ${PID}"
 echo
 head -1 "${LOG}" 2>/dev/null || true

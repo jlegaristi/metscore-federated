@@ -1,14 +1,11 @@
-"""
-Build the pinned data snapshot used by every experiment.
+"""Build the two tables the experiments read, from the source files of the cohorts.
 
-Outputs under ``data/``:
+  data/discovery.csv   20,662 rows: the 22 biomarkers, the label, the cohort and
+                       age, sex and bmi for the stratified results
+  data/external.csv    661 rows from the three validation sites, same columns
 
-  discovery.csv  20,662 rows: 22 biomarkers, label, cohort and the
-                     demographics used for stratified reporting (age, sex, bmi)
-  external.csv   661 rows from three validation sites, same columns
-
-Both tables are derived from the primary sources, so the chain from raw file to
-model input is auditable.
+The script checks row counts against the paper and the derived tables against the
+files used in the original submission, and saves the hashes of its inputs.
 """
 
 from __future__ import annotations
@@ -51,21 +48,23 @@ VALIDATION_IN_GIT = (
 )
 DEMOGRAPHICS = ["age", "sex", "bmi", "metS_profile"]
 
+
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()[:16]
 
+
 def _binarise(series: pd.Series) -> pd.Series:
-    """Labels are 'yes'/'no' in every primary source, 0/1 in the derived files."""
+    """'yes'/'no' labels of the source files as 1/0."""
     if series.dtype == object:
         return (series.astype(str).str.lower() == "yes").astype("int8")
     return series.astype("int8")
 
-def load_panel_definition() -> dict[str, str]:
-    """Map raw NMR variable -> reported biomarker name, from the selection file.
 
-    Ten of the 22 carry a cluster label that differs from the raw variable name
-    (``L5TG`` is reported as ``LDLs 4-5``); the rest keep their own name, which
-    the spreadsheet encodes as an empty ``cluster_name_final``.
+def load_panel_definition() -> dict[str, str]:
+    """Raw NMR variable -> name of the biomarker in the paper, from the selection file.
+
+    Ten of the 22 are reported under the name of their cluster (L5TG is "LDLs 4-5");
+    the others keep their name and have an empty `cluster_name_final`.
     """
     sel = pd.read_excel(SOURCE_DATA / SELECTION_FILE)
     chosen = sel[sel["selected"].astype(str).str.lower() == "yes"]
@@ -87,6 +86,7 @@ def load_panel_definition() -> dict[str, str]:
     print(f"  panel: {len(mapping)} variables, {renamed} renamed to cluster labels")
     return mapping
 
+
 def derive_panel(df: pd.DataFrame, mapping: dict[str, str], label: str) -> pd.DataFrame:
     missing = [v for v in mapping if v not in df.columns]
     if missing:
@@ -96,8 +96,9 @@ def derive_panel(df: pd.DataFrame, mapping: dict[str, str], label: str) -> pd.Da
     panel[TARGET] = _binarise(df[TARGET]).to_numpy()
     return panel[BIOMARKERS + [TARGET]]
 
+
 def _columns_match(a: pd.DataFrame, b: pd.DataFrame, columns: list[str]) -> list[str]:
-    """Compare two tables row-order-independently, column by column."""
+    """Columns whose sorted values differ between two tables."""
     differing = []
     for col in columns:
         x = np.sort(a[col].to_numpy(dtype=float))
@@ -105,6 +106,7 @@ def _columns_match(a: pd.DataFrame, b: pd.DataFrame, columns: list[str]) -> list
         if not np.allclose(x, y, atol=1e-9, equal_nan=True):
             differing.append(col)
     return differing
+
 
 def build_discovery(mapping: dict[str, str]) -> tuple[pd.DataFrame, dict]:
     src = SOURCE_DATA / "metS_data.csv"
@@ -151,6 +153,7 @@ def build_discovery(mapping: dict[str, str]) -> tuple[pd.DataFrame, dict]:
     provenance[SELECTION_FILE] = _sha256(SOURCE_DATA / SELECTION_FILE)
     return discovery, provenance
 
+
 def build_external(mapping: dict[str, str]) -> tuple[pd.DataFrame, dict]:
     frames, provenance = [], {}
 
@@ -181,8 +184,8 @@ def build_external(mapping: dict[str, str]) -> tuple[pd.DataFrame, dict]:
     if len(external) != EXTERNAL_N:
         raise SystemExit(f"VALIDATION: {len(external)} rows, expected {EXTERNAL_N}")
 
-    # The working-tree copy of this file has been overwritten with a different
-    # export, so the reference is read from git rather than from disk.
+    # The reference table is read from git: the copy on disk was overwritten by a
+    # later export.
     blob = subprocess.run(
         ["git", "-C", str(REPO_ROOT), "show", f"HEAD:{VALIDATION_IN_GIT}"],
         capture_output=True, text=True, check=True,
@@ -201,6 +204,7 @@ def build_external(mapping: dict[str, str]) -> tuple[pd.DataFrame, dict]:
     print(f"  reconstruction matches the 661 x 23 table in git HEAD ({rev[:8]})")
     provenance["verified_against"] = f"{VALIDATION_IN_GIT}@{rev[:16]}"
     return external, provenance
+
 
 def main() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -249,6 +253,7 @@ def main() -> None:
         f"\n      {DATA_DIR / 'external.csv'}"
         f"\n      {DATA_DIR / 'PROVENANCE.json'}"
     )
+
 
 if __name__ == "__main__":
     main()

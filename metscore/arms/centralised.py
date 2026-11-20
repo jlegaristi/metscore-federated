@@ -1,19 +1,9 @@
-"""
-Centralized training arms.
+"""Centralized training: one model on the pooled cohorts (unified arm) or on a single
+cohort (individual arm). Both use the same code and differ only in the data.
 
-The unified arm pools every cohort; the individual arm trains on one cohort at a
-time. Both are built from this module, so the only difference between them is
-the data each one sees.
-
-Order of operations per fold:
-
-  1. cut the fold        shared assignment, identical for every arm
-  2. hold out validation from the training folds only
-  3. fit the scaler      on training data only
-  4. rebalance           downsampling and class weights, training data only
-  5. train
-  6. pick the threshold  on validation data, then freeze it
-  7. score               the test fold, and the external cohort
+Per fold: split into train, validation and test; fit the scaler on train; downsample
+and weight the classes; train with early stopping on validation; choose the threshold
+on validation; score the test fold and the external cohort.
 """
 
 from __future__ import annotations
@@ -27,16 +17,18 @@ from .. import data as data_mod
 from .. import evaluation, imbalance, model, profiling, results, runtime, scaling
 from ..config import BIOMARKERS, TARGET, ExperimentConfig, ScalingContract
 
-#: Fixed seed for partitioning external sites into reference/scored. Held
-#: constant across every run so all approaches are scored on identical subjects.
+# Seed of the reference/scored split of the external sites, the same in every run
+# so that all approaches are scored on the same subjects.
 EXTERNAL_PARTITION_SEED = 20261003
 
+
 def _external_sets(external: pd.DataFrame) -> dict[str, scaling.EvaluationSet]:
-    """Partition each external site once, identically for every run."""
+    """Reference/scored split of each external site."""
     return {
         site: scaling.partition_site(block, site, seed=EXTERNAL_PARTITION_SEED)
         for site, block in external.groupby("site", sort=True)
     }
+
 
 def _record_strata(
     writer: results.RunWriter,
@@ -49,7 +41,7 @@ def _record_strata(
     fold: int,
     site: str,
 ) -> None:
-    """Per-cohort, per-sex and per-age-band breakdowns."""
+    """Metrics by cohort, sex and age band."""
     strata = {"cohort": frame["cohort"].to_numpy()}
     if "sex" in frame and frame["sex"].notna().any():
         strata["sex"] = frame["sex"].astype(str).to_numpy()
@@ -63,13 +55,29 @@ def _record_strata(
                 site=site, stratum_kind=kind, stratum=level,
             )
 
+
+def _downsample_by_cohort(x, y, cohort, cfg, seed):
+    """Downsample every cohort separately and pool the result.
+
+    This is the training data of the federated clients put together, so the
+    centralized model can be trained on the samples they hold.
+    """
+    parts = [
+        imbalance.downsample(x[cohort == name], y[cohort == name], cfg, seed)
+        for name in sorted(np.unique(cohort))
+    ]
+    x_all = np.concatenate([part[0] for part in parts])
+    y_all = np.concatenate([part[1] for part in parts])
+    return x_all, y_all, imbalance.class_weights(y_all, cfg)
+
+
 def train_fold(
     cfg: ExperimentConfig,
     train: pd.DataFrame,
     validation: pd.DataFrame,
     seed: int,
 ):
-    """Steps 3-7. Returns the fitted model, scaler, threshold and imbalance log."""
+    """Train one model. Returns it with its scaler, threshold and imbalance log."""
     from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
 
     x_train = data_mod.features(train).to_numpy()
@@ -81,9 +89,14 @@ def train_fold(
     x_train_scaled = scaling.transform_internal(scaler, x_train)
     x_val_scaled = scaling.transform_internal(scaler, x_val)
 
-    x_balanced, y_balanced, weights, _ = imbalance.prepare_training_set(
-        x_train_scaled, y_train, cfg.imbalance, seed=seed
-    )
+    if cfg.imbalance.within_cohort:
+        x_balanced, y_balanced, weights = _downsample_by_cohort(
+            x_train_scaled, y_train, train["cohort"].to_numpy(), cfg.imbalance, seed
+        )
+    else:
+        x_balanced, y_balanced, weights, _ = imbalance.prepare_training_set(
+            x_train_scaled, y_train, cfg.imbalance, seed=seed
+        )
     log = imbalance.describe(y_train, y_balanced)
 
     net = model.build(len(BIOMARKERS), cfg.model)
@@ -109,34 +122,28 @@ def train_fold(
         ],
     )
 
-    # The operating point is chosen here, on validation, and never revisited.
+    # threshold from the validation split
     point = evaluation.select_threshold(
         y_val, net.predict(x_val_scaled, verbose=0).ravel(), cfg.threshold
     )
     return net, scaler, point, log
+
 
 def run(
     cfg: ExperimentConfig,
     cohort: str | None = None,
     repetitions: int | None = None,
 ) -> str:
-    """Execute one centralised arm end to end and write its results.
+    """Run a centralized arm over all folds and write its results.
 
-    ``cohort`` selects the individual arm's institution; ``None`` pools
-    everything, which is the unified arm.
+    `cohort` selects one institution (individual arm); None pools them all.
     """
     discovery = data_mod.load_discovery()
     external = data_mod.load_external()
     external_sets = _external_sets(external)
 
-    # An individual arm trains on its own cohort. It keeps a handle on the full
-    # DISCOVERY frame so that, after training, it can also be scored on the other
-    # cohorts' held-out patients, the question of whether a large institution's
-    # model would serve a small one without federating at all. That extra pass is
-    # recorded under its own evaluation tag and changes nothing already reported.
-    # Named distinctly on purpose: `pooled` is reused further down for the
-    # concatenated external frames, and shadowing it silently made this
-    # evaluation score the validation cohort from the second fold onward.
+    # An individual model is also scored on the held-out patients of the other
+    # cohorts (evaluation "cv:cross_cohort"), so the full frame is kept.
     all_cohorts = discovery
     if cohort is not None:
         discovery = discovery.loc[discovery["cohort"] == cohort].reset_index(drop=True)
@@ -156,17 +163,16 @@ def run(
                 discovery, folds, fold, cfg.cv.validation_fraction, seed
             )
             if train[TARGET].nunique() < 2 or test[TARGET].nunique() < 2:
-                continue  # a tiny cohort can land a fold with only one class
+                continue  # a small cohort can leave a fold with one class
 
             with timer.measure("train"):
-                # Seeded per fold, so folds stay independent draws while the
-                # run as a whole is reproducible.
+                # one seed per fold
                 runtime.seed_everything(seed * 100 + fold)
                 net, scaler, point, imbalance_log = train_fold(
                     cfg, train, validation, seed * 100 + fold
                 )
 
-            # --- cross-validation: the untouched test fold, natural prevalence
+            # cross-validation: the test fold
             with timer.measure("evaluate_cv"):
                 x_test = scaling.transform_internal(scaler, data_mod.features(test).to_numpy())
                 y_test = data_mod.labels(test).to_numpy()
@@ -183,7 +189,7 @@ def run(
                     site=test["cohort"].to_numpy(), subject_index=test.index.to_numpy(),
                 )
 
-            # --- an individual model applied to every other cohort's test fold
+            # an individual model on the test fold of every other cohort
             if cohort is not None:
                 with timer.measure("evaluate_cross_cohort"):
                     every_fold = data_mod.assign_folds(all_cohorts, cfg.cv.folds, seed)
@@ -201,16 +207,16 @@ def run(
                             "cv:cross_cohort", repetition, fold,
                             site=other, stratum_kind="cohort", stratum=other,
                         )
+                        writer.record_predictions(
+                            repetition, fold, f"cv_cross_{other}", y_o, p_o,
+                            site=block["cohort"].to_numpy(),
+                            subject_index=block.index.to_numpy(),
+                        )
 
-            # --- external: same subjects under whichever contract is declared
+            # external cohort
             with timer.measure("evaluate_external"):
-                # Both contracts, one trained model. Scaling affects only how
-                # external features are standardised, so re-training per
-                # contract would burn half the compute for identical models.
-                # Three passes from two contracts. TRAIN_FITTED needs nothing
-                # from the target site, so it scores the whole cohort; the third
-                # pass repeats it on the subset SITE_ADAPTED can reach, which is
-                # where the two contracts may fairly be compared.
+                # The same model under both scaling contracts, plus TRAIN_FITTED
+                # on the subjects SITE_ADAPTED can score, to compare the two.
                 passes = [
                     ("external:%s" % ScalingContract.TRAIN_FITTED.value,
                      ScalingContract.TRAIN_FITTED, False),
@@ -264,11 +270,13 @@ def run(
     )
     return str(path)
 
+
 def run_unified(cfg: ExperimentConfig, **kwargs) -> str:
     return run(cfg, cohort=None, **kwargs)
 
+
 def run_individual(cfg: ExperimentConfig, cohort: str, **kwargs) -> str:
-    """The cohort must be part of the run id, or the five institutions collide."""
+    """Individual arm. The cohort is the strategy, so each one has its own folder."""
     if cfg.strategy != cohort:
         raise ValueError(
             f"individual runs must set strategy to the cohort so each gets its "

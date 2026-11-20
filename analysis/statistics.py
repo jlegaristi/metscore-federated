@@ -1,10 +1,7 @@
-# Statistical comparison between approaches.
+# Pairwise comparison of every approach with FedAvg on the external cohort, bootstrap
+# intervals and the privacy budgets.
 #
-#   DeLong           correlated AUROCs measured on the same subjects
-#   Bootstrap        intervals and p values, resampling subjects
-#   Holm             family-wise error control across the comparisons
-#
-# Run scripts/run_experiments.py first.
+# Run scripts/run_experiments.py first, then this script from analysis/.
 
 import sys
 from pathlib import Path
@@ -15,20 +12,27 @@ import numpy as np
 import pandas as pd
 
 from metscore import results, stats
+from metscore.config import OUTPUT_DIR, RESULTS_DIR
 from metscore.results import to_latex
 from metscore.plotting import label_for
 
 pd.set_option("display.width", 220)
 
-TABLES = Path.cwd().parent / "tables"
-TABLES.mkdir(exist_ok=True)
+TABLES = OUTPUT_DIR / "tables"
+TABLES.mkdir(parents=True, exist_ok=True)
 
 REFERENCE = "federated__fedavg"
 EVALUATION = "external_train_fitted"
 
-# Aligning predictions. Averaging a subject's score across the folds in which
-# they were held out gives one prediction per subject. This is an ensemble
-# quantity and reads higher than the fold-level means of make_tables.py.
+# Resamples behind the pairwise table. Holm multiplies the smallest p value by the
+# number of comparisons, 13, and a bootstrap p value cannot go below 2 / (B + 1), so
+# reporting p < 0.001 after correction needs more than 26,000 resamples.
+RESAMPLES = int(sys.argv[1]) if len(sys.argv) > 1 else 50_000
+
+# One prediction per subject, averaging the 50 fold models. This is the AUROC of an
+# ensemble and comes out higher than the fold means of make_tables.py; it is only
+# used for the intervals further down.
+
 
 def aligned(run_id, evaluation=EVALUATION):
     frame = results.load_predictions(run_id, evaluation)
@@ -38,34 +42,33 @@ def aligned(run_id, evaluation=EVALUATION):
         .reset_index()
     )
 
+
 reference = aligned(REFERENCE)
 print(f"{REFERENCE}: {len(reference)} subjects, {int(reference.y.sum())} positive")
 
-# Pairwise comparison against the federated model.
+# Pairwise comparison with FedAvg.
 #
-# The unit compared is one trained model, not an ensemble of the fifty. Every
-# fold produces a model, every model scores the same 661 external subjects, and
-# the statistic is the mean over folds of the per-fold AUROC difference, which
-# equals the difference of the fold-averaged AUROCs written by make_tables.py.
-# Averaging the fifty models' predictions first would measure an ensemble that
-# no deployment assembles, and favours the least stable models.
-#
-# Uncertainty comes from resampling subjects. Folds share their subjects and
-# most of their training data, so resampling folds measures partition noise.
+# Each fold gives one model per approach, and every model scores the same 661
+# external subjects. The statistic is the mean over folds of the per-fold AUROC
+# difference, i.e. the difference of the fold-averaged AUROCs in the results table.
+# The interval and the p value come from resampling subjects.
 
 COMPARATORS = [
     "unified__centralised",
     "individual__AKRIBEA", "individual__OSARTEN", "individual__LIVERBIBLE",
     "individual__AGEPORTUGAL", "individual__METS+",
-    "federated__fedavg_uniform", "federated__fedmedian", "federated__fedtrimmed",
+    "federated__fedavg_uniform", "federated__fedavg_cohort",
+    "federated__fedmedian", "federated__fedtrimmed",
     "federated__fedprox__mu0.01", "federated__fedprox__mu0.1", "federated__fedprox__mu1.0",
 ]
+
 
 def fold_matrix(run_id, evaluation=EVALUATION):
     """(y, scores) with one row of scores per fold, all on the same subjects."""
     frame = results.load_predictions(run_id, evaluation)
     folds = [g.sort_values("subject_index") for _, g in frame.groupby(["repetition", "fold"])]
     return folds[0].y_true.values, np.vstack([f.y_pred.values for f in folds])
+
 
 y_ext, ref_scores = fold_matrix(REFERENCE)
 print(f"{REFERENCE}: {len(y_ext)} subjects, {int(y_ext.sum())} positive, "
@@ -79,12 +82,12 @@ for run in COMPARATORS:
         print(f"  skipping {run} (not run yet)")
         continue
 
-    test = stats.fold_difference_bootstrap(y_ext, other_scores, ref_scores)
+    test = stats.fold_difference_bootstrap(
+        y_ext, other_scores, ref_scores, n_resamples=RESAMPLES
+    )
     raw_p[run] = test.p_value
 
-    # How often the difference holds up, run by run. A mean difference can come
-    # from every fold or from a few, and that distinction is what a site
-    # deciding whether to federate actually cares about.
+    # DeLong's test in each fold, to see in how many folds the difference holds
     per_fold = [
         stats.delong_test(y_ext, other_scores[k], ref_scores[k]).p_value
         for k in range(ref_scores.shape[0])
@@ -105,15 +108,9 @@ comparison = comparison.drop(columns="run").sort_values("_delta", ascending=Fals
 comparison = comparison.drop(columns="_delta")
 print(comparison.to_string(index=False))
 
-# Federated learning is statistically indistinguishable from the AKRIBEA and
-# OSARTEN models and from the other aggregation rules, ahead of centralized
-# pooling, and ahead of the models of the three small cohorts.
-
+resamples = f"{RESAMPLES:,}".replace(",", "{,}")
 formatted = comparison.rename(columns={"Δ vs FedAvg": "Δ", "folds": "Folds"})
 formatted = formatted[["Approach", "Δ", "95% CI", "p (Holm)", "Folds"]].copy()
-# A bootstrap p of zero means no resample of 1,000 fell on the other side of
-# zero, which is a bound, not a value: reporting "0.000" would claim a precision
-# the procedure cannot deliver.
 formatted["p (Holm)"] = comparison["p (Holm)"].map(
     lambda v: "<0.001" if v < 0.001 else f"{v:.3f}"
 )
@@ -128,17 +125,25 @@ to_latex(
         "external subjects. $\\Delta$ is the mean over folds of the per-fold AUROC "
         "difference with FedAvg, so it is exactly the difference of the "
         "fold-averaged AUROCs in Table~\\ref{tab:results}. Intervals and $p$ values "
-        "come from resampling subjects, not folds, and $p$ is Holm-corrected across "
-        "the twelve comparisons. \\emph{Folds} counts the folds in which DeLong's "
-        "test gives $p < 0.05$."
+        f"come from resampling subjects, not folds ({resamples} resamples), and $p$ "
+        f"is Holm-corrected across the {len(raw_p)} comparisons. \\emph{{Folds}} counts "
+        "the folds in which DeLong's test gives $p < 0.05$."
     ),
 )
 print(f"\nwrote {TABLES / 'pairwise_delong.tex'}")
 
-# Confidence intervals by resampling subjects. Every repetition of the
-# cross-validation sees all 20,662 subjects and only the partition changes, so
-# an interval taken across repetitions measures partition noise and narrows
-# without bound as repetitions are added.
+# The centralized model trained on the clients' samples (sensitivity analysis),
+# against FedAvg and against the centralized arm. Kept out of the family above.
+try:
+    _, cohort_scores = fold_matrix("unified__centralised__cohort-downsampling")
+    _, pooled_scores = fold_matrix("unified__centralised")
+    for name, other in [("FedAvg", ref_scores), ("Centralized", pooled_scores)]:
+        print(f"cohort downsampling vs {name}:",
+              stats.fold_difference_bootstrap(y_ext, cohort_scores, other, n_resamples=RESAMPLES))
+except FileNotFoundError:
+    pass
+
+# Bootstrap intervals of the external AUROC (ensemble predictions).
 
 KEY_RUNS = [
     "unified__centralised", "federated__fedavg", "federated__fedprox__mu0.01",
@@ -165,14 +170,14 @@ print(intervals.to_string(index=False))
 
 to_latex(
     intervals,
-    "External AUROC with 95\% confidence intervals from stratified bootstrap "
+    "External AUROC with 95\\% confidence intervals from stratified bootstrap "
     "resampling of subjects (2{,}000 resamples).",
     "tab:bootstrap", TABLES / "bootstrap_ci.tex", index=False, full_width=False,
 )
 print(f"\nwrote {TABLES / 'bootstrap_ci.tex'}")
 
-# How much the interval changes: the fold-level interval against the
-# subject-level one, for the same federated model.
+# Width of the interval for FedAvg: across folds, Nadeau-Bengio, and resampling
+# subjects.
 
 long = results.collect()
 folds = long[
@@ -192,8 +197,7 @@ print(f"naive across folds     [{naive[0]:.4f}, {naive[1]:.4f}]  width {naive[1]
 print(f"Nadeau-Bengio          [{nb[1]:.4f}, {nb[2]:.4f}]  width {nb[2]-nb[1]:.4f}")
 print(f"subject-level bootstrap[{subject[1]:.4f}, {subject[2]:.4f}]  width {subject[2]-subject[1]:.4f}")
 
-# Paired comparison on the metrics DeLong cannot handle, PR-AUC and PPV, by
-# resampling subjects.
+# Paired bootstrap for PR-AUC, where DeLong does not apply.
 
 from sklearn.metrics import average_precision_score
 
@@ -219,30 +223,42 @@ for run in ["unified__centralised", "individual__AKRIBEA", "individual__METS+"]:
 
 print(pd.DataFrame(rows).to_string(index=False))
 
-# Privacy budgets: the noise multiplier expressed as (epsilon, delta), which
-# is a privacy statement rather than a hyperparameter.
+# Privacy budgets of the differential-privacy runs.
 
 import json
 
 from metscore.privacy import compute_epsilon
 
-rows = []
-for path in sorted(
-    (Path.cwd().parent / "results").glob("federated__dp_fedavg*/profile.json"),
-    key=lambda p: float(p.parent.name.rsplit("noise_multiplier", 1)[1]),
-):
-    dp = json.loads(path.read_text()).get("differential_privacy")
-    if not dp:
-        continue
-    run = path.parent.name
-    auroc = long[
-        (long.run_id == run) & (long.metric == "auroc") & (long.evaluation == "cv")
+
+def private_runs():
+    """(noise multiplier, run id, budget) of each private run, sorted by noise."""
+    found = []
+    for path in RESULTS_DIR.glob("federated__dp_fedavg*/profile.json"):
+        dp = json.loads(path.read_text()).get("differential_privacy")
+        if dp:
+            found.append((dp["noise_multiplier"], path.parent.name, dp))
+    return sorted(found, key=lambda item: item[0])
+
+
+def mean_auroc(run, evaluation):
+    return long[
+        (long.run_id == run) & (long.metric == "auroc") & (long.evaluation == evaluation)
         & (long.site == "ALL") & (long.stratum_kind == "none")
     ]["value"].mean()
+
+
+def shown_epsilon(value):
+    return "$\\infty$" if value == float("inf") else f"{value:.1f}"
+
+
+rows = []
+for noise, run, dp in private_runs():
     rows.append({
-        "Noise multiplier": dp["noise_multiplier"],
-        "ε": round(dp["epsilon"], 1),
-        "CV AUROC": round(auroc, 3),
+        "Noise": "reference" if run.endswith("__reference") else f"{noise:g}",
+        "ε": shown_epsilon(dp["epsilon"]),
+        "ε (no sec. agg.)": shown_epsilon(dp["epsilon_without_secure_aggregation"]),
+        "CV AUROC": round(mean_auroc(run, "cv"), 3),
+        "Ext. AUROC": round(mean_auroc(run, "external:train_fitted"), 3),
         "Clipped": f"{dp['fraction_clipped']:.0%}",
     })
 
@@ -255,13 +271,13 @@ from scipy.optimize import brentq
 for target in (10.0, 3.0, 1.0):
     sigma = brentq(lambda s: compute_epsilon(s, 20).epsilon - target, 0.5, 500, xtol=1e-3)
     print(f"  ε = {target:<5} requires noise multiplier {sigma:.2f}")
-print("\nUtility has collapsed by a multiplier of 0.5, so the two ranges never meet.")
 
 to_latex(
     privacy,
     r"Privacy--utility trade-off for client-level differential privacy over 20 "
     r"rounds of full participation ($\delta = 10^{-5}$), with $\varepsilon$ from "
-    r"the R\'enyi accountant.",
+    r"the R\'enyi accountant. The reference run has the same architecture and "
+    r"weighting with no noise and no active clipping bound.",
     "tab:privacy", TABLES / "privacy_utility.tex", index=False, full_width=False,
 )
 print(f"\nwrote {TABLES / 'privacy_utility.tex'}")

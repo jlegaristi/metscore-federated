@@ -1,8 +1,6 @@
-# Tables, generated from results/ and exported as LaTeX so that no number is
-# transcribed by hand. Nothing here trains a model or recomputes a metric; the
-# arms wrote every measurement and this script only reshapes them.
+# Tables of the paper, written as LaTeX from the metrics saved in results/.
 #
-# Run scripts/run_experiments.py first.
+# Run scripts/run_experiments.py first, then this script from analysis/.
 
 import sys
 from pathlib import Path
@@ -13,21 +11,23 @@ import numpy as np
 import pandas as pd
 
 from metscore import results
+from metscore.config import COHORTS, OUTPUT_DIR, RESULTS_DIR
+from metscore.evaluation import OperatingPoint
+from metscore.evaluation import evaluate as score
 from metscore.results import to_latex, to_latex_grouped
 from metscore.plotting import label_for
 
 pd.set_option("display.width", 220)
 pd.set_option("display.max_columns", 40)
 
-TABLES = Path.cwd().parent / "tables"
-TABLES.mkdir(exist_ok=True)
+TABLES = OUTPUT_DIR / "tables"
+TABLES.mkdir(parents=True, exist_ok=True)
 
 long = results.collect()
 print(f"{len(long):,} measurements across {long.run_id.nunique()} runs")
 print(f"evaluations: {sorted(long.evaluation.unique())}")
 
-# Completeness. Every run should carry 50 folds (10 repetitions x 5 folds) for
-# each evaluation; a short row means the run was interrupted.
+# Every run should have 50 folds (10 repetitions x 5 folds) per evaluation.
 
 overall = long[(long.site == "ALL") & (long.stratum_kind == "none") & (long.metric == "auroc")]
 completeness = overall.groupby(["run_id", "evaluation"]).size().unstack()
@@ -39,29 +39,26 @@ if len(incomplete):
 else:
     print("\nAll runs complete.")
 
-# Fold-level mean and standard deviation. The SD is dispersion across folds,
-# not a confidence interval; intervals come from statistics.py, which resamples
-# subjects.
+# Mean and SD across folds. Confidence intervals are in statistics.py and
+# per_centre.py, from resampling subjects.
 
 METRICS = ["auroc", "pr_auc", "sensitivity", "specificity", "ppv", "ece"]
 
 ORDER = [
     "unified__centralised",
-    "federated__fedavg", "federated__fedavg_uniform",
+    "federated__fedavg", "federated__fedavg_uniform", "federated__fedavg_cohort",
     "federated__fedprox__mu0.01", "federated__fedprox__mu0.1", "federated__fedprox__mu1.0",
     "federated__fedmedian", "federated__fedtrimmed",
     "individual__AKRIBEA", "individual__OSARTEN", "individual__LIVERBIBLE",
     "individual__AGEPORTUGAL", "individual__METS+",
 ]
 
+
 def summarise(evaluation, metrics=METRICS, runs=None, digits=3, include_dp=False):
     """Mean ± SD across folds, one row per run.
 
-    Differential privacy is excluded by default. It is a privacy mechanism
-    layered on FedAvg rather than an alternative training paradigm, so listing
-    its noise levels beside the three arms mixes two axes; and six rows sitting
-    near 0.50 AUROC crowd the table without informing. The privacy--utility
-    trade-off is reported on its own, where the curve is the point.
+    The differential-privacy runs and the persistent-Adam variants are left out
+    unless asked for; they are reported separately.
     """
     sel = long[
         (long.evaluation == evaluation)
@@ -70,7 +67,7 @@ def summarise(evaluation, metrics=METRICS, runs=None, digits=3, include_dp=False
         & (long.metric.isin(metrics))
     ]
     if not include_dp:
-        sel = sel[~sel.run_id.str.contains("dp_fedavg")]
+        sel = sel[~sel.run_id.str.contains("dp_fedavg|adam-persistent")]
     if runs is not None:
         sel = sel[sel.run_id.isin(runs)]
 
@@ -87,14 +84,11 @@ def summarise(evaluation, metrics=METRICS, runs=None, digits=3, include_dp=False
     table.index = [label_for(r) for r in table.index]
     return table
 
-# Cross-validation and external validation in one table: same rows, same
-# metrics, so the comparison reads vertically. Cross-validation is 10
-# repetitions of stratified five-fold; test folds keep the natural prevalence of
-# their cohort. External data are standardized with the scaler learned in
-# training, applied identically to every approach.
+# Main results table: cross-validation and external validation, same metrics.
+
 
 FEDERATED = [
-    "federated__fedavg", "federated__fedavg_uniform",
+    "federated__fedavg", "federated__fedavg_uniform", "federated__fedavg_cohort",
     "federated__fedprox__mu0.01", "federated__fedprox__mu0.1",
     "federated__fedprox__mu1.0", "federated__fedmedian", "federated__fedtrimmed",
 ]
@@ -103,12 +97,58 @@ INDIVIDUAL = [
     "individual__AGEPORTUGAL", "individual__METS+",
 ]
 
-def blocks(evaluation):
-    return [
+# The "cv" records of an institution-specific model cover its own cohort only. The
+# model is also scored on the held-out patients of every cohort in the same fold, and
+# together those are the pooled test fold of the centralized and federated rows, so
+# the cross-validation block can compare all of them on the same patients.
+
+
+def pooled_cross_validation(run_id, reference):
+    """Per-fold metrics of an institution-specific model on the pooled test folds."""
+    scores = pd.concat(
+        [results.load_predictions(run_id, f"cv_cross_{name}") for name in COHORTS.values()],
+        ignore_index=True,
+    )
+    own = long[
+        (long.run_id == run_id) & (long.evaluation == "cv") & (long.site == "ALL")
+        & (long.stratum_kind == "none") & (long.metric == "threshold")
+    ].set_index(["repetition", "fold"])["value"]
+    rows = []
+    for (repetition, fold), block in scores.groupby(["repetition", "fold"]):
+        block = block.sort_values("subject_index")
+        expected = reference[(repetition, fold)]
+        if not (np.array_equal(block.subject_index.to_numpy(), expected.subject_index.to_numpy())
+                and np.array_equal(block.y_true.to_numpy(), expected.y_true.to_numpy())):
+            raise ValueError(f"{run_id}, repetition {repetition} fold {fold}: not the pooled test fold")
+        point = OperatingPoint(float(own[(repetition, fold)]), "youden", "validation")
+        metrics = score(block.y_true.to_numpy(), block.y_pred.to_numpy(), point)
+        rows += [
+            {"run_id": run_id, "evaluation": "cv:pooled", "site": "ALL", "stratum_kind": "none",
+             "repetition": repetition, "fold": fold, "metric": m, "value": getattr(metrics, m)}
+            for m in METRICS
+        ]
+    return pd.DataFrame(rows)
+
+
+centralised_folds = {
+    key: block.sort_values("subject_index")[["subject_index", "y_true"]]
+    for key, block in results.load_predictions("unified__centralised", "cv").groupby(["repetition", "fold"])
+}
+long = pd.concat(
+    [long] + [pooled_cross_validation(run, centralised_folds) for run in INDIVIDUAL],
+    ignore_index=True,
+)
+
+
+def blocks(evaluation, individual=None):
+    parts = [
         (None, summarise(evaluation, runs=["unified__centralised"])),
         ("Federated aggregation strategies", summarise(evaluation, runs=FEDERATED)),
-        ("Institution-specific models", summarise(evaluation, runs=INDIVIDUAL)),
     ]
+    if individual:
+        parts.append(("Institution-specific models", summarise(individual, runs=INDIVIDUAL)))
+    return parts
+
 
 cv = summarise("cv")
 ext = summarise("external:train_fitted")
@@ -116,9 +156,9 @@ print(cv.to_string(), "\n\n", ext.to_string())
 
 _ = to_latex_grouped(
     [
-        ("Cross-validation (50 folds, pooled DISCOVERY)", blocks("cv")),
+        ("Cross-validation (50 folds, pooled DISCOVERY)", blocks("cv", individual="cv:pooled")),
         ("External validation (VALIDATION cohort, n = 661)",
-         blocks("external:train_fitted")),
+         blocks("external:train_fitted", individual="external:train_fitted")),
     ],
     "Performance of every approach under cross-validation and on the independent "
     "external cohort. Mean $\\pm$ SD across 50 folds.",
@@ -128,22 +168,35 @@ _ = to_latex_grouped(
         "The dispersion quoted is the standard deviation across folds, not a "
         "confidence interval. Operating points maximize Youden's index on "
         "held-out validation data and are frozen before scoring; test folds "
-        "retain the natural prevalence of their cohort. In the cross-validation "
-        "block each institution-specific model is scored only within its own "
-        "cohort, so those rows are not comparable with each other or with the "
-        "pooled arms; the external block scores every model on the same 661 "
-        "individuals."
+        "retain the natural prevalence of their cohort. Within each block every "
+        "row is scored on the same individuals, in cross-validation the pooled "
+        "test folds of all five cohorts (Section~\\ref{subsec:validation})."
     ),
 )
 
-# The scaling contract.
-#
-# Re-standardizing each external site against a held-out reference split from
+# Where the centralized arm downsamples: the pooled training data (the arm of the
+# main table) or each cohort on its own, which gives it the samples the federated
+# clients train on.
+DOWNSAMPLING = [
+    "unified__centralised", "unified__centralised__cohort-downsampling", "federated__fedavg",
+]
+if DOWNSAMPLING[1] in set(long.run_id):
+    parts = []
+    for name, evaluation in [("CV", "cv"), ("External", "external:train_fitted")]:
+        part = summarise(evaluation, metrics=["auroc", "ece"], runs=DOWNSAMPLING)
+        parts.append(part.rename(columns={"auroc": f"{name} AUROC", "ece": f"{name} ECE"}))
+    sensitivity = pd.concat(parts, axis=1)
+    print(sensitivity.to_string())
+    _ = to_latex(
+        sensitivity,
+        "The centralized model with downsampling over the pooled training data and "
+        "within each cohort, next to FedAvg. Mean $\\pm$ SD across 50 folds.",
+        "tab:downsampling", TABLES / "downsampling_sensitivity.tex",
+    )
 
-# The two contracts reach different subjects, so the comparison uses
-# train_fitted_common, that is, train-fitted restricted to the rows
-# site-adapted can also score. Comparing against the full train-fitted
-# evaluation would confound the contract with a larger sample.
+# Scaling contracts on the external cohort. Site-adapted scaling cannot score the
+# reference subjects, so it is compared with train-fitted scaling on the subjects
+# both can score (train_fitted_common).
 contract = (
     long[
         (long.metric == "auroc") & (long.site == "ALL")
@@ -172,9 +225,7 @@ _ = to_latex(
     TABLES / "scaling_contract.tex",
 )
 
-# Per external sub-cohort. BPH, GRAZ and TUEBINGEN differ in prevalence (9.6%,
-# 2.9% and 77.6%), so a pooled external AUROC hides the variation between
-# them.
+# External AUROC at each site (prevalence 9.6%, 2.9% and 77.6%).
 
 per_site = (
     long[
@@ -195,9 +246,8 @@ _ = to_latex(
     TABLES / "per_site.tex",
 )
 
-#
-# By sex and by age band. Demographic coverage is complete in DISCOVERY; in the
-# external cohort it is partial and differs by site.
+# Cross-validation AUROC by sex and by age band. Only DISCOVERY has both for
+# every subject.
 
 for kind, caption, label in [
     ("sex", "Cross-validation AUROC stratified by sex.", "tab:strat_sex"),
@@ -218,111 +268,14 @@ for kind, caption, label in [
     print(strat.round(3).to_string())
     _ = to_latex(strat.round(3), caption, label, TABLES / f"strat_{kind}.tex")
 
-#
-# Every model scored on the same held-out patients of each cohort.
-#
-# The cross-validation column above is not a like-for-like comparison: an
-# institution-specific model can only be cross-validated inside its own cohort,
-# which for AKRIBEA is a working-age population at 0.83% prevalence, whereas the
-# centralized and federated models are scored on pooled folds that also contain
-# elderly participants and a MetS-enriched cohort. Scoring every model on the
-# same cohort data removes that confound.
-
-per_cohort = (
-    long[
-        (long.metric == "auroc") & (long.evaluation == "cv")
-        & (long.stratum_kind == "cohort")
-        & (long.run_id.isin(["unified__centralised", "federated__fedavg"]))
-    ]
-    .groupby(["run_id", "stratum"])["value"].mean().unstack()
-)
-
-# An individual model's own CV score already *is* its score on its own cohort.
-own = (
-    long[
-        (long.metric == "auroc") & (long.evaluation == "cv")
-        & (long.site == "ALL") & (long.stratum_kind == "none")
-        & (long.run_id.str.startswith("individual"))
-    ]
-    .groupby("run_id")["value"].mean()
-)
-own.index = [r.split("__", 1)[1] for r in own.index]
-
-sizes = (
-    long[
-        (long.metric == "n") & (long.evaluation == "cv")
-        & (long.stratum_kind == "cohort") & (long.run_id == "federated__fedavg")
-    ]
-    .groupby("stratum")["value"].mean().round(0).astype(int)
-)
-
-# The best model trained at another institution, applied to this cohort's own
-# held-out patients. It is the obvious alternative to federating, so it is
-# reported as a column rather than argued in prose.
-cross = (
-    long[
-        (long.metric == "auroc") & (long.evaluation == "cv:cross_cohort")
-        & (long.run_id.str.startswith("individual"))
-    ]
-    .groupby(["run_id", "stratum"])["value"].mean().unstack()
-)
-cross.index = [r.split("__", 1)[1] for r in cross.index]
-best_other, best_other_name = {}, {}
-for coh in cross.columns:
-    others = cross[coh].drop(index=coh, errors="ignore").dropna()
-    if len(others):
-        best_other[coh] = others.max()
-        best_other_name[coh] = others.idxmax()
-
-# Short headers, because six columns of prose titles overrun an IEEE column.
-# The table note carries the definitions.
-democratisation = pd.DataFrame({
-    "n": sizes,
-    "Local": own,
-    # Value and source in one cell: a separate column for the institution reads
-    # as a sixth number and costs width for nothing.
-    "Best other": pd.Series(
-        {c: f"{v:.3f} ({best_other_name[c]})" for c, v in best_other.items()}
-    ),
-    "Centralized": per_cohort.loc["unified__centralised"],
-    "Federated": per_cohort.loc["federated__fedavg"],
-})
-democratisation["Δ"] = democratisation["Federated"] - democratisation["Local"]
-democratisation = democratisation.sort_values("n")
-print("\nbest other model per cohort:", best_other_name)
-print(democratisation.round(3).to_string())
-
-print(
-    "\nRead this way: federation costs the two large institutions nothing on "
-    "their own patients, raises the small ones above both their own model and "
-    "the best model any other institution could lend them, and is beaten only "
-    "on METS+, by centralised pooling."
-)
-
-_ = to_latex(
-    democratisation.round(3),
-    "AUROC on each cohort's own held-out data",
-    "tab:global_on_local",
-    TABLES / "global_on_local.tex",
-    full_width=True,
-    tabcolsep="4pt",
-    note=(
-        "All four models are scored on the same held-out subjects of the cohort "
-        "named in the row. \\emph{Local} is the model trained on that cohort "
-        "alone; \\emph{Best other} is the best-performing model trained at a "
-        "single different institution, named in parentheses; "
-        "\\emph{Centralized} is trained on all five cohorts pooled. $n$ is the "
-        "mean size of the held-out fold, one fifth of the cohort. $\\Delta$ is "
-        "Federated minus Local."
-    ),
-)
+# Cost of each paradigm over the 50 folds.
 
 
 import json
 
 rows = []
 for run in ["unified__centralised", "federated__fedavg", "federated__fedprox__mu0.01"]:
-    profile = Path.cwd().parent / "results" / run / "profile.json"
+    profile = RESULTS_DIR / run / "profile.json"
     if not profile.exists():
         continue
     data = json.loads(profile.read_text())
@@ -339,9 +292,10 @@ cost = pd.DataFrame(rows).set_index("Approach")
 print(cost.to_string())
 _ = to_latex(
     cost,
-    "Computational and communication cost for 50 folds. Communication is "
-    "derived analytically from the protocol: 24{,}289 parameters $\\times$ 4 bytes "
-    "$\\times$ 2 directions $\\times$ 20 rounds $\\times$ 5 clients.",
+    "Computational and communication cost for 50 folds. Communication follows from "
+    "the protocol: every transmitted value (trainable weights and batch normalization "
+    "statistics) $\\times$ 4 bytes $\\times$ 2 directions $\\times$ 20 rounds "
+    "$\\times$ 5 clients.",
     "tab:cost",
     TABLES / "cost.tex",
 )

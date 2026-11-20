@@ -9,12 +9,21 @@ the same protocol:
 
 - **centralized**, a single model trained on the pooled cohorts;
 - **institution-specific**, one model per cohort, trained on that cohort alone;
-- **federated**, one client per cohort, with five aggregation rules (FedAvg,
-  uniformly weighted FedAvg, FedProx, coordinate-wise median and trimmed mean)
-  and optional client-level differential privacy.
+- **federated**, one client per cohort, with six aggregation rules (FedAvg,
+  uniformly weighted FedAvg, FedAvg weighted by cohort size, FedProx,
+  coordinate-wise median and trimmed mean) and optional client-level
+  differential privacy.
 
 Aggregation uses Flower's implementations, called in process rather than through
 its simulation engine.
+
+Every client standardizes with one federated scaler, pooled from the count, mean
+and variance each client reports once before training. Every strategy minimizes
+the same local objective, the one the centralized arms minimize, and differs only
+in the proximal term. Adam is reset at the start of each round. For differential
+privacy, each client clips its own update and adds its share of the noise, and the
+server takes an unweighted mean; `metscore/privacy.py` states the protected unit,
+the neighbouring relation and the trust assumptions.
 
 ## Requirements
 
@@ -37,7 +46,7 @@ cannot be redistributed here. Access requires authorization from those
 institutions.
 
 With the source files in place, `scripts/prepare_data.py` writes the snapshot
-the experiments consume:
+the experiments consume. Set `METSCORE_DATA_DIR` to keep it outside this clone:
 
 ```bash
 python scripts/prepare_data.py
@@ -52,7 +61,7 @@ python scripts/prepare_data.py
 
 ```bash
 python scripts/run_experiments.py --list        # the grid
-python scripts/run_experiments.py --smoke       # one fold per arm
+python scripts/run_experiments.py --smoke       # a short run of every job, to check that it works
 python scripts/run_experiments.py               # the full grid
 python scripts/run_experiments.py --only federated --workers 12
 ```
@@ -64,6 +73,11 @@ hidden. The model is small enough that this is faster than a GPU; see
 
 Every run is seeded per fold, so a configuration reproduces its results exactly.
 
+Besides the three paradigms, the grid has three sensitivity analyses: FedAvg and
+FedProx keeping the state of Adam between rounds, the centralized model with each
+cohort downsampled on its own (the samples the federated clients train on), and the
+differential-privacy sweep with its noise-free reference.
+
 ## Output layout
 
 ```
@@ -73,6 +87,9 @@ results/
     config.json                 the configuration that produced it
     metrics.csv                 long format, one row per measurement
     profile.json                wall clock, compute time, communication
+    code_version.json           the commit that produced the run
+    aggregation_weights.csv     the weight each client received, per fold
+    round_log.csv               federated validation score per round
     predictions/                per-fold subject-level scores
 ```
 
@@ -90,8 +107,14 @@ hand.
 cd analysis
 python make_tables.py           # tables/*.tex
 python statistics.py            # pairwise tests, privacy budgets
+python per_centre.py            # weights, per-site results, paired institution gains
 MPLBACKEND=Agg python make_figures.py
 ```
+
+`statistics.py` and `per_centre.py` take the number of bootstrap resamples as an
+argument. The defaults are the ones behind the paper (50,000 for the pairwise table,
+2,000 for intervals and 20,000 for the paired differences); a much smaller number is
+enough for a first look.
 
 ## Layout
 
@@ -119,6 +142,12 @@ analysis/          tables, statistics and figures
 
 Released under the MIT License; see `LICENSE`.
 
+## History
+
+Commit `aa38117` is the code of the first revised submission. The current version
+corrects the issues found in review (standardization, aggregation weights, the local
+objective of FedProx, differential privacy) and adds the analyses per centre.
+
 ## Citation
 
-TODO: add the reference once the paper is published.
+The reference will be added once the paper is published.

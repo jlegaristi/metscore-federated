@@ -1,1 +1,1 @@
-"""Training arms. Each consumes the shared core; none redefines it."""
+"""Training arms: centralized (pooled or one cohort) and federated."""

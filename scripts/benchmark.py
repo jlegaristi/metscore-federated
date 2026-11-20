@@ -1,5 +1,4 @@
-"""
-Measure training throughput per device and threading configuration.
+"""Time one training epoch on CPU (1, 2, 8 threads, unconstrained) and on GPU.
 
 Run:  python scripts/benchmark.py
 """
@@ -14,14 +13,16 @@ WORKSPACE = Path(__file__).resolve().parent.parent
 
 WORKER = WORKSPACE / "scripts" / "_benchmark_worker.py"
 
+
 def run(device: str, threads: int) -> float | None:
-    """Time one configuration in a fresh process; None if it failed."""
+    """ms/epoch for one configuration, or None if the worker failed."""
     result = subprocess.run(
         [sys.executable, str(WORKER), device, str(threads)],
         capture_output=True, text=True,
     )
     lines = [ln for ln in result.stdout.strip().splitlines() if ln.strip().isdigit()]
     return float(lines[-1]) if lines else None
+
 
 def main() -> None:
     configurations = [
@@ -52,6 +53,7 @@ def main() -> None:
         '  CUDA_VISIBLE_DEVICES="" OMP_NUM_THREADS=1 '
         "TF_NUM_INTRAOP_THREADS=1 TF_NUM_INTEROP_THREADS=1"
     )
+
 
 if __name__ == "__main__":
     main()

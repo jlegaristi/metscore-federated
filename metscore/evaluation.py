@@ -1,13 +1,9 @@
-"""
-Metrics, computed by one implementation for every arm.
+"""Metrics and the operating threshold, the same code for every arm.
 
-The operating point maximizes Youden's index on held-out validation data and is
-frozen before the test fold is scored. Test folds are never resampled, so every
-metric refers to the natural prevalence of its cohort.
-
-Reported: AUROC, PR-AUC, sensitivity, specificity, PPV, NPV, F1, balanced
-accuracy, Brier score and expected calibration error, optionally within strata
-(site, sex, age band).
+The threshold maximizes Youden's index on validation data and is then applied
+unchanged to the test fold and to the external cohort. Metrics: AUROC, PR-AUC,
+sensitivity, specificity, PPV, NPV, F1, balanced accuracy, Brier score and expected
+calibration error, overall and by stratum (site, sex, age band).
 """
 
 from __future__ import annotations
@@ -23,45 +19,72 @@ from sklearn.metrics import (
 
 from .config import ThresholdConfig
 
+
 @dataclass(frozen=True)
 class OperatingPoint:
-    """A threshold, and the data it was chosen on.
-
-    ``selected_on`` is carried into the results so a reader can verify the
-    threshold never came from the data it is scoring.
-    """
+    """A threshold and the split it was chosen on."""
 
     threshold: float
     criterion: str
     selected_on: str
     youden_index: float = float("nan")
 
-def select_threshold(
+
+@dataclass(frozen=True)
+class ThresholdCounts:
+    """What a client sends for the threshold: counts per candidate, no scores."""
+
+    true_positives: np.ndarray
+    false_positives: np.ndarray
+    n_positive: int
+    n_negative: int
+    finite: bool
+
+
+def threshold_counts(
     y_val: np.ndarray,
     p_val: np.ndarray,
     cfg: ThresholdConfig | None = None,
-) -> OperatingPoint:
-    """Choose the operating point on validation data.
-
-    ThresholdConfig refuses to be constructed with ``source="test"``, so this
-    function cannot be pointed at a test fold by configuration. Callers must
-    still pass validation predictions; the arms assert this.
-    """
+) -> ThresholdCounts:
+    """Validation cases and non-cases at or above each candidate threshold."""
     cfg = cfg or ThresholdConfig()
     y_val = np.asarray(y_val).ravel()
     p_val = np.asarray(p_val).ravel()
 
-    if len(np.unique(y_val)) < 2 or not np.all(np.isfinite(p_val)):
-        # One class present, or a diverged model: no threshold is meaningful.
+    grid = np.linspace(cfg.min_threshold, cfg.max_threshold, cfg.resolution)
+    pos, neg = y_val == 1, y_val == 0
+    predicted = p_val[None, :] >= grid[:, None]
+    return ThresholdCounts(
+        true_positives=(predicted & pos[None, :]).sum(axis=1),
+        false_positives=(predicted & neg[None, :]).sum(axis=1),
+        n_positive=int(pos.sum()),
+        n_negative=int(neg.sum()),
+        finite=bool(np.all(np.isfinite(p_val))),
+    )
+
+
+def select_threshold_from_counts(
+    counts: list[ThresholdCounts],
+    cfg: ThresholdConfig | None = None,
+) -> OperatingPoint:
+    """Threshold maximizing Youden's index over the summed counts of the clients.
+
+    The sums are the counts of the pooled validation predictions, so the threshold
+    is the one they would give.
+    """
+    cfg = cfg or ThresholdConfig()
+    n_pos = sum(c.n_positive for c in counts)
+    n_neg = sum(c.n_negative for c in counts)
+
+    if n_pos == 0 or n_neg == 0 or not all(c.finite for c in counts):
+        # a single class, or non-finite predictions
         return OperatingPoint(0.5, cfg.criterion, cfg.source)
 
     grid = np.linspace(cfg.min_threshold, cfg.max_threshold, cfg.resolution)
-    pos, neg = y_val == 1, y_val == 0
-    n_pos, n_neg = pos.sum(), neg.sum()
-
-    predicted = p_val[None, :] >= grid[:, None]
-    sensitivity = (predicted & pos[None, :]).sum(axis=1) / n_pos
-    specificity = (~predicted & neg[None, :]).sum(axis=1) / n_neg
+    true_positives = np.sum([c.true_positives for c in counts], axis=0)
+    false_positives = np.sum([c.false_positives for c in counts], axis=0)
+    sensitivity = true_positives / n_pos
+    specificity = (n_neg - false_positives) / n_neg
     youden = sensitivity + specificity - 1.0
 
     best = int(np.argmax(youden))
@@ -72,13 +95,23 @@ def select_threshold(
         youden_index=float(youden[best]),
     )
 
+
+def select_threshold(
+    y_val: np.ndarray,
+    p_val: np.ndarray,
+    cfg: ThresholdConfig | None = None,
+) -> OperatingPoint:
+    """Threshold maximizing Youden's index on one set of validation predictions."""
+    return select_threshold_from_counts([threshold_counts(y_val, p_val, cfg)], cfg)
+
+
 def calibration_curve(
     y: np.ndarray, p: np.ndarray, n_bins: int = 10
 ) -> dict[str, list[float]]:
-    """Reliability curve using quantile bins.
+    """Reliability curve on quantile bins.
 
-    Quantile rather than uniform bins because predicted probabilities on a 2%
-    prevalence problem pile up near zero, leaving uniform bins empty.
+    At 2% prevalence most predictions are close to zero and equal-width bins would
+    be nearly empty.
     """
     y = np.asarray(y).ravel()
     p = np.asarray(p).ravel()
@@ -99,6 +132,7 @@ def calibration_curve(
 
     return {"predicted": predicted, "observed": observed, "count": count}
 
+
 def expected_calibration_error(y: np.ndarray, p: np.ndarray, n_bins: int = 10) -> float:
     curve = calibration_curve(y, p, n_bins)
     if not curve["count"]:
@@ -112,9 +146,10 @@ def expected_calibration_error(y: np.ndarray, p: np.ndarray, n_bins: int = 10) -
         / total
     )
 
+
 @dataclass
 class Metrics:
-    """Everything reported for one (model, evaluation set) pair."""
+    """The metrics of one model on one evaluation set."""
 
     n: int
     n_positive: int
@@ -142,12 +177,12 @@ class Metrics:
         d.pop("calibration", None)
         return d
 
-def diverged(y: np.ndarray, operating_point: OperatingPoint) -> Metrics:
-    """Metrics for a model whose predictions are not finite.
 
-    Recorded rather than raised so a differential-privacy sweep reports where
-    utility collapses instead of losing the run. `n` and `prevalence` stay real
-    so the row still says which evaluation it belongs to.
+def diverged(y: np.ndarray, operating_point: OperatingPoint) -> Metrics:
+    """A row of NaNs for a model with non-finite predictions.
+
+    Happens with strong differential-privacy noise; the run goes on and the
+    failure is saved as such.
     """
     y = np.asarray(y).ravel().astype(int)
     nan = float("nan")
@@ -160,25 +195,19 @@ def diverged(y: np.ndarray, operating_point: OperatingPoint) -> Metrics:
         balanced_accuracy=nan, tp=0, fp=0, tn=0, fn=0,
     )
 
+
 def evaluate(
     y: np.ndarray,
     p: np.ndarray,
     operating_point: OperatingPoint,
     n_bins: int = 10,
 ) -> Metrics:
-    """Score predictions at a threshold that was frozen elsewhere.
-
-    ``y`` must retain the natural prevalence of its cohort, test folds are
-    never downsampled, so PPV means what a clinical reader expects it to mean.
-    """
+    """All metrics of a set of predictions at a given threshold."""
     y = np.asarray(y).ravel().astype(int)
     p = np.asarray(p).ravel().astype(float)
     if y.shape != p.shape:
         raise ValueError(f"shape mismatch: y={y.shape} p={p.shape}")
 
-    # A model can genuinely diverge (enough differential-privacy noise will do
-    # it), and the record of that is a row of NaNs on the privacy-utility curve
-    # rather than an exception that discards the rest of the sweep.
     if not np.all(np.isfinite(p)):
         return diverged(y, operating_point)
 
@@ -223,6 +252,7 @@ def evaluate(
         calibration=calibration_curve(y, p, n_bins) if both_classes else {},
     )
 
+
 def evaluate_by_stratum(
     y: np.ndarray,
     p: np.ndarray,
@@ -230,23 +260,22 @@ def evaluate_by_stratum(
     operating_point: OperatingPoint,
     min_n: int = 20,
 ) -> dict[str, Metrics]:
-    """    Strata smaller than ``min_n`` are skipped rather than reported with
-        uninterpretable intervals; the caller records which ones were dropped.
-    """
+    """Metrics within each stratum; strata under `min_n` or with one class are skipped."""
     y = np.asarray(y).ravel()
     p = np.asarray(p).ravel()
     strata = np.asarray(strata).ravel()
 
     out = {}
-    for level in np.unique(strata[strata == strata]):  # drops NaN
+    for level in np.unique(strata[strata == strata]):  # NaN != NaN
         mask = strata == level
         if mask.sum() < min_n or len(np.unique(y[mask])) < 2:
             continue
         out[str(level)] = evaluate(y[mask], p[mask], operating_point)
     return out
 
+
 def age_bands(age: np.ndarray) -> np.ndarray:
-    """The age bands used for stratified reporting."""
+    """Age band of each subject."""
     edges = [18, 25, 35, 45, 55, 65, 70, 80, 105]
     labels = ["18-24", "25-34", "35-44", "45-54", "55-64", "65-69", "70-79", "80+"]
     age = np.asarray(age, dtype=float)
